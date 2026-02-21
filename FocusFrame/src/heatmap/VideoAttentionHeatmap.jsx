@@ -2,13 +2,49 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
 
 import { generateSyntheticGaze, computeHeatmapForFrame, computeRegionAttention, computeAttentionTimeline } from "./gazeUtils.js";
-import { heatColor, renderSimulatedFrame } from "./canvasUtils.js";
+import { heatColor } from "./canvasUtils.js";
+import { initEyeTracker, stopEyeTracker as destroyEyeTracker, fitCalibration, irisToScreen, resetCalibration, applyBiasCorrection } from "./eyeTracker.js";
 import { btnStyle, formatTime, ToggleBtn, SliderControl, PanelCard, StatRow, Insight } from "./UIComponents.jsx";
 
 const VIDEO_W = 640;
 const VIDEO_H = 360;
 const DURATION = 30;
 const FPS = 30;
+
+// Moving-dot calibration path: fractional (fx, fy) waypoints within the canvas.
+// The dot travels through all corners, edges, and interior over CAL_DURATION_MS ms.
+const CAL_WAYPOINTS = [
+  [0.5,  0.5 ],  // center
+  [0.05, 0.05],  // top-left
+  [0.95, 0.05],  // top-right
+  [0.95, 0.95],  // bottom-right
+  [0.05, 0.95],  // bottom-left
+  [0.05, 0.05],  // top-left (close square)
+  [0.5,  0.05],  // top-center
+  [0.5,  0.5 ],  // center
+  [0.95, 0.5 ],  // right-center
+  [0.5,  0.5 ],  // center
+  [0.5,  0.95],  // bottom-center
+  [0.5,  0.5 ],  // center
+  [0.05, 0.5 ],  // left-center
+  [0.5,  0.5 ],  // center
+  [0.3,  0.3 ],  // inner top-left
+  [0.7,  0.3 ],  // inner top-right
+  [0.7,  0.7 ],  // inner bottom-right
+  [0.3,  0.7 ],  // inner bottom-left
+  [0.5,  0.5 ],  // center (finish)
+];
+const CAL_DURATION_MS = 26000; // kept for reference — actual time is dwell/transit based now
+
+// Verification dots shown after calibration: user looks + clicks each one.
+// The difference between model prediction and actual click position becomes the bias correction.
+const VERIFY_DOTS = [
+  { fx: 0.5,  fy: 0.5  },  // center
+  { fx: 0.08, fy: 0.08 },  // top-left
+  { fx: 0.92, fy: 0.08 },  // top-right
+  { fx: 0.08, fy: 0.92 },  // bottom-left
+  { fx: 0.92, fy: 0.92 },  // bottom-right
+];
 
 export default function VideoAttentionHeatmap() {
   const canvasRef = useRef(null);
@@ -19,6 +55,10 @@ export default function VideoAttentionHeatmap() {
   const uploadedVideoRef = useRef(null); // uploaded mp4
   const fileInputRef = useRef(null);
   const renderCanvasRef = useRef(null); // stable ref to latest renderCanvas
+  const liveGazeCursorRef = useRef(null); // latest gaze position in canvas coords {x,y}
+  const smoothedGazeRef = useRef(null);    // EMA-smoothed gaze in canvas coords
+  const eyeTrackerRafRef = useRef(null);   // rAF id for eye tracker canvas loop
+  const calibrationCanvasRectRef = useRef(null); // canvas bounding rect at calibration start
 
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -34,11 +74,41 @@ export default function VideoAttentionHeatmap() {
   const [uploadedVideoDuration, setUploadedVideoDuration] = useState(null);
   const [uploadedVideoName, setUploadedVideoName] = useState(null);
 
+  // ─── Eye Tracker state ─────────────────────────────────────────────
+  const [eyeTrackerStatus, setEyeTrackerStatus] = useState("idle"); // idle|loading|calibrating|verifying|tracking|error
+  const [eyeTrackerError, setEyeTrackerError] = useState(null);
+  // 1€ filter state — adapts smoothing to gaze velocity (smooth when still, responsive when moving)
+  const oneEuroRef = useRef(null); // { x, dx, y, dy, t } or null
+  // Previous iris for inter-frame jump rejection
+  const prevIrisRef = useRef(null);
+  // Verification step state (post-calibration bias correction)
+  const verifyStepRef      = useRef(0);
+  const verifyResidualsRef = useRef([]);
+  const [verifyStep, setVerifyStep] = useState(0);
+  // Moving-dot calibration state
+  const calibDotPosRef      = useRef({ fx: 0.5, fy: 0.5 }); // current dot position (fractions)
+  const calibAnimRef        = useRef(null);                  // rAF id for the animation loop
+  const calibAnimRunningRef = useRef(false);                 // true while dot is moving — gates iris sampling
+  const [calibrationProgress, setCalibrationProgress] = useState(-1); // -1=ready, 0-1=running
+  // MediaPipe iris tracking: rolling raw-iris buffer (last 20 frames) + accumulated calibration pairs
+  const irisBufferRef = useRef([]);        // [{ x, y }]  normalised 0-1 iris coords
+  const calibrationPairsRef = useRef([]);  // [{ iris:{x,y}, screen:{x,y} }]
+  const [liveGazeData, setLiveGazeData] = useState([]);   // state copy — drives chart/regions
+  const liveGazeRef = useRef([]);                          // mutable accumulator — drives canvas
+  const currentVideoTimeRef = useRef(0);                   // always latest currentTime (no stale closure)
+  const liveGazeUpdateTimer = useRef(null);
+
   const gazeData = useMemo(() => generateSyntheticGaze(DURATION, FPS, VIDEO_W, VIDEO_H), []);
-  const timeline = useMemo(() => computeAttentionTimeline(gazeData, DURATION), [gazeData]);
+
+  // Use real gaze when tracking, synthetic otherwise
+  const activeGazeData = eyeTrackerStatus === "tracking" ? liveGazeData : gazeData;
+  const timeline = useMemo(
+    () => computeAttentionTimeline(activeGazeData, uploadedVideoDuration || DURATION),
+    [activeGazeData, uploadedVideoDuration]
+  );
   const regions = useMemo(
-    () => computeRegionAttention(gazeData, currentTime, windowSize, VIDEO_W, VIDEO_H, 4),
-    [gazeData, currentTime, windowSize]
+    () => computeRegionAttention(activeGazeData, currentTime, windowSize, VIDEO_W, VIDEO_H, 4),
+    [activeGazeData, currentTime, windowSize]
   );
 
   // ─── Camera ────────────────────────────────────────────────────────
@@ -110,6 +180,284 @@ export default function VideoAttentionHeatmap() {
   // cleanup blob URL on unmount
   useEffect(() => () => { if (uploadedVideoUrl) URL.revokeObjectURL(uploadedVideoUrl); }, [uploadedVideoUrl]);
 
+  // Keep currentVideoTimeRef in sync so the gaze listener can tag points without stale closures
+  useEffect(() => { currentVideoTimeRef.current = currentTime; }, [currentTime]);
+
+  // Cleanup eye tracker on unmount
+  useEffect(() => () => {
+    destroyEyeTracker();
+    if (liveGazeUpdateTimer.current) clearInterval(liveGazeUpdateTimer.current);
+  }, []);
+
+  // ─── Eye Tracker handlers ───────────────────────────────────────────
+  const startEyeTracker = useCallback(async () => {
+    try {
+      setEyeTrackerStatus("loading");
+      setEyeTrackerError(null);
+      irisBufferRef.current = [];
+      calibrationPairsRef.current = [];
+      oneEuroRef.current = null;
+      prevIrisRef.current = null;
+      resetCalibration();
+
+      await initEyeTracker(({ x: ix, y: iy }) => {
+        // Always maintain the rolling iris buffer.
+        // Jump rejection: if iris teleports more than 0.2 units in one frame
+        // it's a detection glitch — discard before it enters calibration or smoothing.
+        const prev = prevIrisRef.current;
+        if (prev) {
+          const dist = Math.sqrt((ix - prev.x) ** 2 + (iy - prev.y) ** 2);
+          if (dist > 0.2) { prevIrisRef.current = { x: ix, y: iy }; return; }
+        }
+        prevIrisRef.current = { x: ix, y: iy };
+
+        irisBufferRef.current.push({ x: ix, y: iy });
+        if (irisBufferRef.current.length > 20) irisBufferRef.current.shift();
+
+        // ── High-frequency calibration sampling ──────────────────────
+        // Record a pair for every single iris detection while the dot is
+        // animating — far more pairs than sampling once per anim frame.
+        if (calibAnimRunningRef.current) {
+          const cr = calibrationCanvasRectRef.current;
+          const { fx, fy } = calibDotPosRef.current;
+          if (cr) {
+            calibrationPairsRef.current.push({
+              iris:   { x: ix, y: iy },
+              screen: { x: cr.left + fx * cr.width, y: cr.top + fy * cr.height },
+            });
+          }
+        }
+
+        // Map iris → screen → canvas only when calibrated.
+        const screenPt = irisToScreen(ix, iy);
+        if (!screenPt) return;
+
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = VIDEO_W / rect.width;
+        const scaleY = VIDEO_H / rect.height;
+        const rawCx = (screenPt.x - rect.left) * scaleX;
+        const rawCy = (screenPt.y - rect.top) * scaleY;
+
+        // ── 1€ filter ────────────────────────────────────────────────
+        // Adapts its cutoff frequency to gaze speed:
+        //   still gaze  → low cutoff  → heavy smoothing (removes jitter)
+        //   fast saccade → high cutoff → low lag
+        // Params tuned for ~60 fps webcam eye tracking:
+        //   minCutoff=0.5 Hz, beta=0.08, dCutoff=1.0 Hz
+        const MIN_FC = 0.5, BETA = 0.08, D_FC = 1.0;
+        const now_s = performance.now() / 1000;
+        const prev1e = oneEuroRef.current;
+        let sc;
+        if (!prev1e) {
+          sc = { x: rawCx, y: rawCy };
+          oneEuroRef.current = { x: rawCx, dx: 0, y: rawCy, dy: 0, t: now_s };
+        } else {
+          const dt = Math.max(now_s - prev1e.t, 1e-4);
+          // Derivative (speed estimator) — filtered at fixed dCutoff
+          const ad = 1 / (1 + 1 / (2 * Math.PI * D_FC * dt));
+          const dxRaw = (rawCx - prev1e.x) / dt;
+          const dyRaw = (rawCy - prev1e.y) / dt;
+          const dx = ad * dxRaw + (1 - ad) * prev1e.dx;
+          const dy = ad * dyRaw + (1 - ad) * prev1e.dy;
+          const speed = Math.sqrt(dx * dx + dy * dy);
+          // Adaptive cutoff — rises with speed
+          const fc = MIN_FC + BETA * speed;
+          const a  = 1 / (1 + 1 / (2 * Math.PI * fc * dt));
+          const fx = a * rawCx + (1 - a) * prev1e.x;
+          const fy = a * rawCy + (1 - a) * prev1e.y;
+          sc = { x: fx, y: fy };
+          oneEuroRef.current = { x: fx, dx, y: fy, dy, t: now_s };
+        }
+        smoothedGazeRef.current = sc;
+        liveGazeCursorRef.current = { x: Math.round(sc.x), y: Math.round(sc.y) };
+        // Only record to heatmap when actively tracking (not calibrating)
+        if (sc.x >= 0 && sc.x < VIDEO_W && sc.y >= 0 && sc.y < VIDEO_H) {
+          liveGazeRef.current.push({
+            timestamp: currentVideoTimeRef.current,
+            x: Math.round(sc.x),
+            y: Math.round(sc.y),
+            frame: Math.round(currentVideoTimeRef.current * FPS),
+          });
+        }
+      });
+
+      setEyeTrackerStatus("calibrating");
+      // Snapshot canvas rect now so the animation positions the dot over the canvas
+      calibrationCanvasRectRef.current = canvasRef.current?.getBoundingClientRect() ?? null;
+      calibDotPosRef.current = { fx: 0.5, fy: 0.5 };
+      setCalibrationProgress(-1); // -1 = "ready" — show Start button
+    } catch (err) {
+      setEyeTrackerStatus("error");
+      setEyeTrackerError(err.message);
+    }
+  }, []);
+
+  const stopEyeTracker = useCallback(() => {
+    if (calibAnimRef.current) { cancelAnimationFrame(calibAnimRef.current); calibAnimRef.current = null; }
+    calibAnimRunningRef.current = false;
+    destroyEyeTracker();
+    if (liveGazeUpdateTimer.current) { clearInterval(liveGazeUpdateTimer.current); liveGazeUpdateTimer.current = null; }
+    if (eyeTrackerRafRef.current) { cancelAnimationFrame(eyeTrackerRafRef.current); eyeTrackerRafRef.current = null; }
+    liveGazeCursorRef.current = null;
+    smoothedGazeRef.current = null;
+    oneEuroRef.current = null;
+    prevIrisRef.current = null;
+    irisBufferRef.current = [];
+    calibrationPairsRef.current = [];
+    setEyeTrackerStatus("idle");
+  }, []);
+
+  // ─── Verification click handler ─────────────────────────────────────
+  // After calibration, user clicks each of the VERIFY_DOTS while looking at it.
+  // We compare model prediction (irisToScreen on current iris) vs actual dot screen pos,
+  // accumulate residuals, then applyBiasCorrection with the mean before starting tracking.
+  const handleVerifyClick = useCallback((e) => {
+    e.stopPropagation();
+    const cr = calibrationCanvasRectRef.current;
+    if (!cr) return;
+    const dot = VERIFY_DOTS[verifyStepRef.current];
+    const dotSx = cr.left + dot.fx * cr.width;
+    const dotSy = cr.top  + dot.fy * cr.height;
+
+    // Sample mean iris from buffer — this is what the user was looking at
+    const buf = irisBufferRef.current;
+    const samples = buf.slice(-8);
+    if (samples.length >= 2) {
+      const mi = {
+        x: samples.reduce((s, p) => s + p.x, 0) / samples.length,
+        y: samples.reduce((s, p) => s + p.y, 0) / samples.length,
+      };
+      const pred = irisToScreen(mi.x, mi.y);
+      if (pred) {
+        verifyResidualsRef.current.push({ dx: dotSx - pred.x, dy: dotSy - pred.y });
+      }
+    }
+
+    verifyStepRef.current += 1;
+    const next = verifyStepRef.current;
+
+    if (next >= VERIFY_DOTS.length) {
+      // Compute mean bias and apply it
+      const res = verifyResidualsRef.current;
+      if (res.length > 0) {
+        const meanDx = res.reduce((s, r) => s + r.dx, 0) / res.length;
+        const meanDy = res.reduce((s, r) => s + r.dy, 0) / res.length;
+        applyBiasCorrection(meanDx, meanDy);
+      }
+      setVerifyStep(next);
+      setEyeTrackerStatus("tracking");
+      liveGazeUpdateTimer.current = setInterval(() => {
+        setLiveGazeData([...liveGazeRef.current]);
+      }, 500);
+    } else {
+      setVerifyStep(next);
+    }
+  }, []);
+
+  const resetGazeData = useCallback(() => {
+    liveGazeRef.current = [];
+    setLiveGazeData([]);
+  }, []);
+
+  const recalibrate = useCallback(() => {
+    if (calibAnimRef.current) { cancelAnimationFrame(calibAnimRef.current); calibAnimRef.current = null; }
+    calibAnimRunningRef.current = false;
+    if (liveGazeUpdateTimer.current) { clearInterval(liveGazeUpdateTimer.current); liveGazeUpdateTimer.current = null; }
+    liveGazeCursorRef.current = null;
+    smoothedGazeRef.current = null;
+    oneEuroRef.current = null;
+    prevIrisRef.current = null;
+    irisBufferRef.current = [];
+    calibrationPairsRef.current = [];
+    resetCalibration();
+    calibrationCanvasRectRef.current = canvasRef.current?.getBoundingClientRect() ?? null;
+    calibDotPosRef.current = { fx: 0.5, fy: 0.5 };
+    verifyStepRef.current = 0;
+    verifyResidualsRef.current = [];
+    setVerifyStep(0);
+    setCalibrationProgress(-1);
+    setEyeTrackerStatus("calibrating");
+  }, []);
+
+  // ─── Moving-dot calibration animation ──────────────────────────────
+  // Dwell/transit architecture:
+  //   DWELL phase  — dot stationary at waypoint; record iris samples after
+  //                  SETTLE_MS so the eye has had time to land on the target.
+  //   TRANSIT phase — dot sweeps to next waypoint; sampling disabled because
+  //                   the eye is mid-saccade and hasn't arrived yet.
+  const DWELL_MS   = 1400; // hold at each waypoint (ms)
+  const TRANSIT_MS = 1200; // sweep between waypoints (ms)
+  const SETTLE_MS  = 400;  // silence at start of each dwell (eye settling)
+
+  const beginCalibrationAnimation = useCallback(() => {
+    calibrationPairsRef.current = [];
+    calibAnimRunningRef.current = false;
+    const cr = calibrationCanvasRectRef.current;
+    if (!cr) return;
+
+    const WP = CAL_WAYPOINTS;
+    const N  = WP.length;
+    const TOTAL_MS = N * DWELL_MS + (N - 1) * TRANSIT_MS;
+
+    let wpIdx     = 0;       // index of current target waypoint
+    let phase     = 'dwell'; // 'dwell' | 'transit'
+    let phaseStart = performance.now();
+
+    // Start at first waypoint
+    calibDotPosRef.current = { fx: WP[0][0], fy: WP[0][1] };
+
+    function frame(now) {
+      const phaseElapsed = now - phaseStart;
+
+      if (phase === 'dwell') {
+        // Enable sampling only after the eye has settled onto the dot
+        calibAnimRunningRef.current = phaseElapsed >= SETTLE_MS;
+
+        if (phaseElapsed >= DWELL_MS) {
+          calibAnimRunningRef.current = false;
+          if (wpIdx < N - 1) {
+            phase = 'transit';
+            phaseStart = now;
+            wpIdx++;
+          } else {
+            // All waypoints done — fit then go to verification
+            calibAnimRef.current = null;
+            fitCalibration(calibrationPairsRef.current);
+            verifyStepRef.current = 0;
+            verifyResidualsRef.current = [];
+            setVerifyStep(0);
+            setEyeTrackerStatus('verifying');
+            return;
+          }
+        }
+      } else {
+        // Transit — never sample; ease dot toward next waypoint
+        calibAnimRunningRef.current = false;
+        const [ax, ay] = WP[wpIdx - 1];
+        const [bx, by] = WP[wpIdx];
+        const t = Math.min(phaseElapsed / TRANSIT_MS, 1);
+        // Sine ease-in-out — smoother than quadratic (no discontinuous second derivative)
+        const eased = -(Math.cos(Math.PI * t) - 1) / 2;
+        calibDotPosRef.current = { fx: ax + (bx - ax) * eased, fy: ay + (by - ay) * eased };
+
+        if (phaseElapsed >= TRANSIT_MS) {
+          calibDotPosRef.current = { fx: bx, fy: by };
+          phase = 'dwell';
+          phaseStart = now;
+        }
+      }
+
+      // Overall progress 0→1
+      const elapsed = wpIdx * (DWELL_MS + TRANSIT_MS) + phaseElapsed;
+      setCalibrationProgress(Math.min(elapsed / TOTAL_MS, 1));
+      calibAnimRef.current = requestAnimationFrame(frame);
+    }
+
+    calibAnimRef.current = requestAnimationFrame(frame);
+  }, []);
+
   // ─── Canvas Render ─────────────────────────────────────────────────
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -119,12 +467,44 @@ export default function VideoAttentionHeatmap() {
     canvas.height = VIDEO_H;
     ctx.clearRect(0, 0, VIDEO_W, VIDEO_H);
 
-    if (uploadedVideoUrl && uploadedVideoRef.current && uploadedVideoRef.current.readyState >= 2) {
+    const isEyeTracking = eyeTrackerStatus === "tracking" || eyeTrackerStatus === "calibrating" || eyeTrackerStatus === "verifying";
+
+    if (!isEyeTracking && uploadedVideoUrl && uploadedVideoRef.current && uploadedVideoRef.current.readyState >= 2) {
       ctx.drawImage(uploadedVideoRef.current, 0, 0, VIDEO_W, VIDEO_H);
-    } else if (cameraEnabled && videoRef.current && videoRef.current.readyState === HTMLMediaElement.HAVE_ENOUGH_DATA) {
+    } else if (!isEyeTracking && cameraEnabled && videoRef.current && videoRef.current.readyState === HTMLMediaElement.HAVE_ENOUGH_DATA) {
       ctx.drawImage(videoRef.current, 0, 0, VIDEO_W, VIDEO_H);
+    } else if (isEyeTracking) {
+      // ── Gaze test pattern ──────────────────────────────────────────
+      // Dark background with a subtle grid
+      ctx.fillStyle = "#0d0e14";
+      ctx.fillRect(0, 0, VIDEO_W, VIDEO_H);
+      // Grid
+      ctx.strokeStyle = "rgba(255,255,255,0.05)";
+      ctx.lineWidth = 1;
+      for (let gx = 0; gx <= VIDEO_W; gx += VIDEO_W / 8) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, VIDEO_H); ctx.stroke(); }
+      for (let gy = 0; gy <= VIDEO_H; gy += VIDEO_H / 4) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(VIDEO_W, gy); ctx.stroke(); }
+      // Corner targets
+      const targets = [
+        { x: 60, y: 50 }, { x: VIDEO_W - 60, y: 50 },
+        { x: VIDEO_W / 2, y: VIDEO_H / 2 },
+        { x: 60, y: VIDEO_H - 50 }, { x: VIDEO_W - 60, y: VIDEO_H - 50 },
+      ];
+      targets.forEach(({ x, y }) => {
+        ctx.strokeStyle = "rgba(180,120,255,0.5)";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(x, y, 18, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x - 26, y); ctx.lineTo(x + 26, y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x, y - 26); ctx.lineTo(x, y + 26); ctx.stroke();
+      });
+      // Label
+      ctx.font = "700 13px 'JetBrains Mono', monospace";
+      ctx.fillStyle = "rgba(180,120,255,0.5)";
+      ctx.textAlign = "center";
+      ctx.fillText(eyeTrackerStatus === "tracking" ? "GAZE TEST — look around to verify tracking" : eyeTrackerStatus === "verifying" ? "FINE-TUNE — look at each dot and click it" : "CALIBRATING — follow the dot", VIDEO_W / 2, VIDEO_H - 16);
+      ctx.textAlign = "left";
     } else {
-      // No source — dark placeholder
+      // No source
       ctx.fillStyle = "#0d0e14";
       ctx.fillRect(0, 0, VIDEO_W, VIDEO_H);
       ctx.font = "600 15px 'JetBrains Mono', monospace";
@@ -137,8 +517,10 @@ export default function VideoAttentionHeatmap() {
       ctx.textAlign = "left";
     }
 
+    const gazeForRender = eyeTrackerStatus === "tracking" ? liveGazeRef.current : gazeData;
+
     if (showHeatmap) {
-      const { grid, w, h, resolution } = computeHeatmapForFrame(gazeData, currentTime, windowSize, VIDEO_W, VIDEO_H, 4);
+      const { grid, w, h, resolution } = computeHeatmapForFrame(gazeForRender, currentTime, windowSize, VIDEO_W, VIDEO_H, 4);
       const imgData = ctx.createImageData(VIDEO_W, VIDEO_H);
       for (let gy = 0; gy < h; gy++) {
         for (let gx = 0; gx < w; gx++) {
@@ -173,7 +555,7 @@ export default function VideoAttentionHeatmap() {
     if (showGaze) {
       const tMin = currentTime - windowSize / 2;
       const tMax = currentTime + windowSize / 2;
-      for (const pt of gazeData) {
+      for (const pt of gazeForRender) {
         if (pt.timestamp >= tMin && pt.timestamp <= tMax) {
           const age = Math.abs(pt.timestamp - currentTime) / (windowSize / 2);
           ctx.beginPath();
@@ -183,11 +565,51 @@ export default function VideoAttentionHeatmap() {
         }
       }
     }
-  }, [gazeData, currentTime, showHeatmap, showGaze, heatmapOpacity, windowSize, cameraEnabled, uploadedVideoUrl]);
+
+    // ── Live gaze cursor (only while tracking) ─────────────────────
+    if (eyeTrackerStatus === "tracking") {
+      const cur = liveGazeCursorRef.current;
+      if (cur && cur.x >= 0 && cur.x < VIDEO_W && cur.y >= 0 && cur.y < VIDEO_H) {
+        const cx = cur.x, cy = cur.y;
+        // Outer pulsing ring
+        ctx.beginPath();
+        ctx.arc(cx, cy, 20, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(255, 80, 40, 0.7)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Inner filled dot
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255, 80, 40, 0.95)";
+        ctx.fill();
+        // Crosshair arms
+        ctx.strokeStyle = "rgba(255, 80, 40, 0.5)";
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(cx - 28, cy); ctx.lineTo(cx - 22, cy); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(cx + 22, cy); ctx.lineTo(cx + 28, cy); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(cx, cy - 28); ctx.lineTo(cx, cy - 22); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(cx, cy + 22); ctx.lineTo(cx, cy + 28); ctx.stroke();
+      }
+    }
+  }, [gazeData, currentTime, showHeatmap, showGaze, heatmapOpacity, windowSize, cameraEnabled, uploadedVideoUrl, eyeTrackerStatus]);
 
   // Keep a stable ref so the rAF loop can call the latest version without stale closure
   useEffect(() => { renderCanvasRef.current = renderCanvas; }, [renderCanvas]);
   useEffect(() => { renderCanvas(); }, [renderCanvas]);
+
+  // ─── Eye tracker canvas loop (runs independently of video playback)
+  useEffect(() => {
+    if (eyeTrackerStatus !== "tracking") {
+      if (eyeTrackerRafRef.current) { cancelAnimationFrame(eyeTrackerRafRef.current); eyeTrackerRafRef.current = null; }
+      return;
+    }
+    const tick = () => {
+      renderCanvasRef.current?.();
+      eyeTrackerRafRef.current = requestAnimationFrame(tick);
+    };
+    eyeTrackerRafRef.current = requestAnimationFrame(tick);
+    return () => { if (eyeTrackerRafRef.current) { cancelAnimationFrame(eyeTrackerRafRef.current); eyeTrackerRafRef.current = null; } };
+  }, [eyeTrackerStatus]);
 
   // ─── Playback Loop ─────────────────────────────────────────────────
   useEffect(() => {
@@ -228,7 +650,7 @@ export default function VideoAttentionHeatmap() {
   }, [isPlaying, uploadedVideoUrl]);
 
   const topRegions = regions.slice(0, 5);
-  const totalGazePoints = gazeData.length;
+  const totalGazePoints = activeGazeData.length;
   const currentBucket = timeline.find(b => Math.abs(b.time - Math.round(currentTime * 2) / 2) < 0.3);
   const currentIntensity = currentBucket ? currentBucket.intensity : 0;
   const peakTime = timeline.reduce((best, b) => b.intensity > best.intensity ? b : best, timeline[0]);
@@ -262,14 +684,204 @@ export default function VideoAttentionHeatmap() {
             </div>
           </div>
           <div style={{ display: "flex", gap: 16, fontSize: 11, color: "#555", alignItems: "center" }}>
-            {uploadedVideoName
-              ? <span style={{ color: "#a0c8ff", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>📹 {uploadedVideoName}</span>
-              : <span>{totalGazePoints.toLocaleString()} gaze points</span>
+            {eyeTrackerStatus === "tracking"
+              ? <span style={{ color: "#60ff8c", display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#60ff8c", display: "inline-block" }} />
+                  {liveGazeData.length.toLocaleString()} live gaze pts
+                </span>
+              : uploadedVideoName
+                ? <span style={{ color: "#a0c8ff", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>📹 {uploadedVideoName}</span>
+                : <span>{totalGazePoints.toLocaleString()} gaze points</span>
             }
             <span>{uploadedVideoDuration ? `${uploadedVideoDuration.toFixed(1)}s` : `${DURATION}s`} duration</span>
             <span>{FPS} fps</span>
           </div>
         </div>
+
+        {/* Eye Tracker Calibration Overlay */}
+        {eyeTrackerStatus === "calibrating" && (() => {
+          const cr = calibrationCanvasRectRef.current;
+          if (!cr) return null;
+          const { fx, fy } = calibDotPosRef.current;
+          const dotX = cr.left + fx * cr.width;
+          const dotY = cr.top  + fy * cr.height;
+          const isRunning = calibrationProgress >= 0;
+          return (
+            <div style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(0,0,0,0.82)", pointerEvents: "none" }}>
+
+              {/* Canvas border highlight */}
+              <div style={{
+                position: "fixed",
+                left: cr.left, top: cr.top,
+                width: cr.width, height: cr.height,
+                border: "2px solid rgba(255,96,40,0.4)",
+                borderRadius: 8,
+                pointerEvents: "none",
+              }} />
+
+              {/* Instruction text above canvas */}
+              <div style={{
+                position: "fixed",
+                left: cr.left, top: cr.top - 72,
+                width: cr.width, textAlign: "center",
+                pointerEvents: "none",
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "#fff", marginBottom: 4 }}>
+                  EYE TRACKER CALIBRATION
+                </div>
+                <div style={{ fontSize: 11, color: "#aaa" }}>
+                  {isRunning
+                    ? "Follow the dot with your eyes — keep your head still"
+                    : "Keep your head still and follow the moving dot with your eyes only"}
+                </div>
+              </div>
+
+              {/* Progress bar */}
+              {isRunning && (
+                <div style={{
+                  position: "fixed",
+                  left: cr.left, top: cr.top + cr.height + 10,
+                  width: cr.width, height: 4,
+                  background: "rgba(255,255,255,0.1)",
+                  borderRadius: 2, pointerEvents: "none",
+                }}>
+                  <div style={{
+                    width: `${calibrationProgress * 100}%`, height: "100%",
+                    background: "linear-gradient(90deg,#ff6040,#ffb420)",
+                    borderRadius: 2, transition: "width 0.05s linear",
+                  }} />
+                </div>
+              )}
+
+              {/* Moving dot */}
+              {isRunning && (
+                <div style={{
+                  position: "fixed",
+                  left: dotX, top: dotY,
+                  transform: "translate(-50%,-50%)",
+                  width: 22, height: 22, borderRadius: "50%",
+                  background: "rgba(255,96,40,0.95)",
+                  boxShadow: "0 0 20px rgba(255,96,40,0.9), 0 0 40px rgba(255,96,40,0.5)",
+                  animation: "calPulse 0.6s ease-in-out infinite",
+                  pointerEvents: "none",
+                }} />
+              )}
+
+              {/* Start button — shown before animation begins */}
+              {!isRunning && (
+                <button
+                  onClick={beginCalibrationAnimation}
+                  style={{
+                    position: "fixed",
+                    left: cr.left + cr.width / 2, top: cr.top + cr.height / 2,
+                    transform: "translate(-50%,-50%)",
+                    ...btnStyle,
+                    background: "rgba(255,96,40,0.2)", color: "#ff6040",
+                    border: "1px solid rgba(255,96,40,0.6)",
+                    padding: "10px 28px", fontSize: 14, fontWeight: 700,
+                    pointerEvents: "all",
+                  }}
+                >▶ Start Calibration</button>
+              )}
+
+              <button
+                onClick={stopEyeTracker}
+                style={{
+                  position: "fixed",
+                  left: cr.left + cr.width / 2, top: cr.top + cr.height + (isRunning ? 28 : 16),
+                  transform: "translateX(-50%)",
+                  ...btnStyle,
+                  background: "rgba(255,60,60,0.15)", color: "#ff6060",
+                  border: "1px solid rgba(255,60,60,0.3)", padding: "7px 18px",
+                  pointerEvents: "all",
+                }}
+              >✕ Cancel</button>
+
+              <style>{`@keyframes calPulse{0%,100%{box-shadow:0 0 20px rgba(255,96,40,0.9),0 0 40px rgba(255,96,40,0.5)}50%{box-shadow:0 0 30px rgba(255,96,40,1),0 0 60px rgba(255,96,40,0.7)}}`}</style>
+            </div>
+          );
+        })()}
+
+        {/* Verification Overlay — post-calibration bias correction */}
+        {eyeTrackerStatus === "verifying" && (() => {
+          const cr = calibrationCanvasRectRef.current;
+          if (!cr) return null;
+          const dot = VERIFY_DOTS[Math.min(verifyStep, VERIFY_DOTS.length - 1)];
+          const dotX = cr.left + dot.fx * cr.width;
+          const dotY = cr.top  + dot.fy * cr.height;
+          return (
+            <div style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(0,0,0,0.82)", pointerEvents: "none" }}>
+
+              <div style={{
+                position: "fixed",
+                left: cr.left, top: cr.top,
+                width: cr.width, height: cr.height,
+                border: "2px solid rgba(96,200,255,0.4)",
+                borderRadius: 8, pointerEvents: "none",
+              }} />
+
+              <div style={{
+                position: "fixed",
+                left: cr.left, top: cr.top - 72,
+                width: cr.width, textAlign: "center",
+                pointerEvents: "none",
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "#fff", marginBottom: 4 }}>
+                  FINE-TUNE CALIBRATION
+                </div>
+                <div style={{ fontSize: 11, color: "#aaa" }}>
+                  Look at the <span style={{ color: "#60c8ff" }}>dot</span> and click it — {verifyStep + 1} / {VERIFY_DOTS.length}
+                </div>
+              </div>
+
+              {/* Completed dots */}
+              {VERIFY_DOTS.slice(0, verifyStep).map((d, i) => (
+                <div key={i} style={{
+                  position: "fixed",
+                  left: cr.left + d.fx * cr.width,
+                  top:  cr.top  + d.fy * cr.height,
+                  transform: "translate(-50%,-50%)",
+                  width: 12, height: 12, borderRadius: "50%",
+                  background: "#60ff8c", opacity: 0.7,
+                  boxShadow: "0 0 6px #60ff8c",
+                  pointerEvents: "none",
+                }} />
+              ))}
+
+              {/* Active dot */}
+              <div
+                onClick={handleVerifyClick}
+                style={{
+                  position: "fixed", left: dotX, top: dotY,
+                  transform: "translate(-50%,-50%)",
+                  width: 30, height: 30, borderRadius: "50%",
+                  background: "rgba(96,200,255,0.95)",
+                  boxShadow: "0 0 20px rgba(96,200,255,0.9), 0 0 40px rgba(96,200,255,0.5)",
+                  animation: "verifyPulse 0.8s ease-in-out infinite",
+                  cursor: "crosshair",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 9, color: "#000", fontWeight: 700,
+                  pointerEvents: "all",
+                }}
+              >{verifyStep + 1}</div>
+
+              <button
+                onClick={stopEyeTracker}
+                style={{
+                  position: "fixed",
+                  left: cr.left + cr.width / 2, top: cr.top + cr.height + 16,
+                  transform: "translateX(-50%)",
+                  ...btnStyle,
+                  background: "rgba(255,60,60,0.15)", color: "#ff6060",
+                  border: "1px solid rgba(255,60,60,0.3)", padding: "7px 18px",
+                  pointerEvents: "all",
+                }}
+              >✕ Cancel</button>
+
+              <style>{`@keyframes verifyPulse{0%,100%{box-shadow:0 0 20px rgba(96,200,255,0.9),0 0 40px rgba(96,200,255,0.5)}50%{box-shadow:0 0 30px rgba(96,200,255,1),0 0 60px rgba(96,200,255,0.7)}}`}</style>
+            </div>
+          );
+        })()}
 
         {/* Hidden uploaded video element */}
         {uploadedVideoUrl && (
@@ -535,6 +1147,62 @@ export default function VideoAttentionHeatmap() {
                 📷 {cameraLoading ? "Loading..." : cameraEnabled ? "Stop Camera" : "Start Camera"}
               </button>
               {cameraError && <div style={{ fontSize: 10, color: "#ff6060", marginTop: 8 }}>✕ {cameraError}</div>}
+            </PanelCard>
+
+            {/* Eye Tracker */}
+            <PanelCard title="Eye Tracker">
+              {eyeTrackerStatus === "idle" && (
+                <button onClick={startEyeTracker} style={{
+                  ...btnStyle, width: "100%",
+                  background: "rgba(180,120,255,0.1)", color: "#c080ff",
+                  border: "1px solid rgba(180,120,255,0.3)", padding: "10px 0",
+                }}>👁 Start Eye Tracker</button>
+              )}
+              {eyeTrackerStatus === "loading" && (
+                <div style={{ fontSize: 11, color: "#c080ff", textAlign: "center", padding: "8px 0" }}>Loading eye tracker…</div>
+              )}
+              {eyeTrackerStatus === "calibrating" && (
+                <div style={{ fontSize: 11, color: "#ffb420", textAlign: "center", padding: "8px 0" }}>● Calibrating — follow the dot</div>
+              )}
+              {eyeTrackerStatus === "verifying" && (
+                <div style={{ fontSize: 11, color: "#60c8ff", textAlign: "center", padding: "8px 0" }}>● Fine-tuning — look &amp; click each dot ({verifyStep}/{VERIFY_DOTS.length})</div>
+              )}
+              {eyeTrackerStatus === "tracking" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#60ff8c", boxShadow: "0 0 6px #60ff8c", animation: "pulse 1.5s infinite" }} />
+                    <span style={{ fontSize: 11, color: "#60ff8c", fontWeight: 700 }}>LIVE TRACKING</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: "#555" }}>{liveGazeData.length.toLocaleString()} gaze pts collected</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <button onClick={recalibrate} style={{
+                      ...btnStyle, flex: 1, fontSize: 10,
+                      background: "rgba(180,120,255,0.1)", color: "#c080ff",
+                      border: "1px solid rgba(180,120,255,0.3)",
+                    }}>↺ Recalibrate</button>
+                    <button onClick={resetGazeData} style={{
+                      ...btnStyle, flex: 1, fontSize: 10,
+                      background: "rgba(255,255,255,0.05)", color: "#888",
+                      border: "1px solid rgba(255,255,255,0.08)",
+                    }}>⟲ Reset Data</button>
+                    <button onClick={stopEyeTracker} style={{
+                      ...btnStyle, fontSize: 10,
+                      background: "rgba(255,60,60,0.1)", color: "#ff8080",
+                      border: "1px solid rgba(255,60,60,0.2)",
+                    }}>Stop</button>
+                  </div>
+                </div>
+              )}
+              {eyeTrackerStatus === "error" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ fontSize: 10, color: "#ff6060" }}>✕ {eyeTrackerError}</div>
+                  <button onClick={startEyeTracker} style={{
+                    ...btnStyle, width: "100%", fontSize: 10,
+                    background: "rgba(255,255,255,0.05)", color: "#888",
+                    border: "1px solid rgba(255,255,255,0.08)",
+                  }}>Retry</button>
+                </div>
+              )}
             </PanelCard>
 
             {/* Data Panel */}
