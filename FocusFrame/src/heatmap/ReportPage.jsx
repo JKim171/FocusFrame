@@ -10,6 +10,7 @@ import {
   loadSessions, saveSessions, deleteSession as deleteSessionById,
   aggregateSessions, exportSessionsJSON, importSessionsJSON,
 } from "./sessionStore.js";
+import GazeReplayPlayer from "./GazeReplayPlayer.jsx";
 
 const VIDEO_W = 640;
 const VIDEO_H = 360;
@@ -38,6 +39,8 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
         duration: agg.duration,
         videoName: agg.videoName,
         sessionCount: agg.sessionCount,
+        // Pass individual session gaze arrays so timeline can average per-session
+        perSessionGaze: sessions.map(s => s.gazePoints),
         label: `All Viewers (${agg.sessionCount})`,
       };
     }
@@ -62,7 +65,13 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
     };
   }, [selectedSessionId, sessions, reportData]);
 
-  const { gazeData, duration, videoName } = activeData;
+  const { gazeData, duration, videoName, sessionCount = 1, perSessionGaze = null } = activeData;
+
+  // videoFile is only available for the freshly recorded session (File objects
+  // can't be persisted to localStorage). Show the replay player only then.
+  const videoFile = selectedSessionId === reportData?.activeSessionId
+    ? (reportData?.videoFile ?? null)
+    : null;
 
   // ─── Import handler ────────────────────────────────────────────────
   const handleImport = useCallback(async (e) => {
@@ -95,30 +104,51 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
 
   const timeline = useMemo(() => {
     if (gazeData.length === 0) return [];
-    if (hasWallTime) {
-      const maxT = Math.max(...gazeData.map(p => p.wallTime ?? 0));
-      const buckets = [];
+
+    // Helper: compute bucketed intensity for a single session's gaze array
+    function sessionTimeline(gaze) {
+      const hw = gaze.some(p => p.wallTime !== undefined);
+      const timeKey = hw ? 'wallTime' : 'timestamp';
+      const maxT = Math.max(...gaze.map(p => p[timeKey] ?? 0));
+      const out = [];
       for (let t = 0; t <= maxT; t += BUCKET_SEC) {
-        const count = gazeData.filter(
-          p => p.wallTime !== undefined && p.wallTime >= t && p.wallTime < t + BUCKET_SEC
-        ).length;
-        // Absolute scale: EXPECTED_GAZE_HZ * BUCKET_SEC points = 100%
-        const intensity = Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * BUCKET_SEC)) * 100));
-        buckets.push({ time: +t.toFixed(1), intensity });
+        const count = gaze.filter(p => {
+          const v = p[timeKey];
+          return v !== undefined && v >= t && v < t + BUCKET_SEC;
+        }).length;
+        out.push(Math.min(100, (count / (EXPECTED_GAZE_HZ * BUCKET_SEC)) * 100));
       }
-      return buckets;
+      return out;
     }
-    // Fallback: timestamp-based with relative normalisation
-    const maxT2 = gazeData.length > 0 ? Math.max(...gazeData.map(p => p.timestamp)) : duration;
-    const maxT3 = Math.max(maxT2, duration);
-    const buckets2 = [];
-    for (let t = 0; t <= maxT3; t += BUCKET_SEC) {
-      const count = gazeData.filter(p => p.timestamp >= t && p.timestamp < t + BUCKET_SEC).length;
-      const intensity = Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * BUCKET_SEC)) * 100));
-      buckets2.push({ time: +t.toFixed(1), intensity });
+
+    if (perSessionGaze && perSessionGaze.length > 1) {
+      // Compute each session's intensity separately, then average per bucket.
+      // This is the only correct way to average attention across viewers —
+      // pooling gaze points inflates counts for every bucket by N×.
+      const perSession = perSessionGaze
+        .filter(g => g.length > 0)
+        .map(g => sessionTimeline(g));
+      if (perSession.length === 0) return [];
+
+      const maxLen = Math.max(...perSession.map(s => s.length));
+      const avg = [];
+      for (let i = 0; i < maxLen; i++) {
+        const vals = perSession
+          .map(s => s[i])              // undefined for shorter sessions
+          .filter(v => v !== undefined);
+        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+        avg.push({ time: +(i * BUCKET_SEC).toFixed(1), intensity: Math.round(mean) });
+      }
+      return avg;
     }
-    return buckets2;
-  }, [gazeData, duration, hasWallTime]);
+
+    // Single session path (same as before)
+    const singleGaze = perSessionGaze?.[0] ?? gazeData;
+    return sessionTimeline(singleGaze).map((intensity, i) => ({
+      time: +(i * BUCKET_SEC).toFixed(1),
+      intensity: Math.round(intensity),
+    }));
+  }, [gazeData, duration, hasWallTime, sessionCount, perSessionGaze]);
 
   // Region map: filter by wallTime full window when available, else full timestamp window
   const regions = useMemo(() => {
@@ -132,14 +162,33 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
     return computeRegionAttention(gazeData, duration / 2, duration + 1, VIDEO_W, VIDEO_H, 4);
   }, [gazeData, duration, hasWallTime]);
 
+  // Smoothed timeline — 5-point Gaussian weighted rolling avg.
+  // All stats AND the chart use this so they stay consistent with each other.
+  const smoothedTimeline = useMemo(() => {
+    if (timeline.length < 3) return timeline;
+    const weights = [0.1, 0.2, 0.4, 0.2, 0.1];
+    const hw = Math.floor(weights.length / 2);
+    return timeline.map((b, i) => {
+      let sum = 0, wSum = 0;
+      for (let j = 0; j < weights.length; j++) {
+        const idx = i - hw + j;
+        if (idx >= 0 && idx < timeline.length) {
+          sum += timeline[idx].intensity * weights[j];
+          wSum += weights[j];
+        }
+      }
+      return { ...b, intensity: Math.round(sum / wSum) };
+    });
+  }, [timeline]);
+
   const totalPoints = gazeData.length;
-  const avgIntensity = timeline.length > 0
-    ? Math.round(timeline.reduce((s, b) => s + b.intensity, 0) / timeline.length)
+  const avgIntensity = smoothedTimeline.length > 0
+    ? Math.round(smoothedTimeline.reduce((s, b) => s + b.intensity, 0) / smoothedTimeline.length)
     : 0;
-  const peakBucket = timeline.reduce((best, b) => b.intensity > best.intensity ? b : best, timeline[0] ?? { time: 0, intensity: 0 });
-  const lowBucket  = timeline.reduce((best, b) => b.intensity < best.intensity ? b : best, timeline[0] ?? { time: 0, intensity: 0 });
-  const highBuckets = timeline.filter(b => b.intensity > 70).length;
-  const highPct = timeline.length > 0 ? Math.round((highBuckets / timeline.length) * 100) : 0;
+  const peakBucket = smoothedTimeline.reduce((best, b) => b.intensity > best.intensity ? b : best, smoothedTimeline[0] ?? { time: 0, intensity: 0 });
+  const lowBucket  = smoothedTimeline.reduce((best, b) => b.intensity < best.intensity ? b : best, smoothedTimeline[0] ?? { time: 0, intensity: 0 });
+  const highBuckets = smoothedTimeline.filter(b => b.intensity > 70).length;
+  const highPct = smoothedTimeline.length > 0 ? Math.round((highBuckets / smoothedTimeline.length) * 100) : 0;
 
   // Center bias — inner 2×2 of the 4×4 grid
   const centerCells = regions.filter(r => r.row >= 1 && r.row <= 2 && r.col >= 1 && r.col <= 2);
@@ -168,12 +217,12 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
     : 0;
 
   // Attention segments — first/last third intensity comparison
-  const thirdLen = Math.floor(timeline.length / 3) || 1;
-  const firstThirdAvg = timeline.length > 0
-    ? Math.round(timeline.slice(0, thirdLen).reduce((s, b) => s + b.intensity, 0) / thirdLen)
+  const thirdLen = Math.floor(smoothedTimeline.length / 3) || 1;
+  const firstThirdAvg = smoothedTimeline.length > 0
+    ? Math.round(smoothedTimeline.slice(0, thirdLen).reduce((s, b) => s + b.intensity, 0) / thirdLen)
     : 0;
-  const lastThirdAvg = timeline.length > 0
-    ? Math.round(timeline.slice(-thirdLen).reduce((s, b) => s + b.intensity, 0) / thirdLen)
+  const lastThirdAvg = smoothedTimeline.length > 0
+    ? Math.round(smoothedTimeline.slice(-thirdLen).reduce((s, b) => s + b.intensity, 0) / thirdLen)
     : 0;
   const attentionTrend = lastThirdAvg > firstThirdAvg + 5 ? "increasing" : lastThirdAvg < firstThirdAvg - 5 ? "decreasing" : "stable";
 
@@ -185,25 +234,6 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
     () => [...regions].sort((a, b) => b.attention - a.attention),
     [regions]
   );
-
-  // Smoothed timeline for the chart — 5-point Gaussian weighted rolling avg
-  // so the display flows between values instead of snapping 0↔100
-  const smoothedTimeline = useMemo(() => {
-    if (timeline.length < 3) return timeline;
-    const weights = [0.1, 0.2, 0.4, 0.2, 0.1];
-    const hw = Math.floor(weights.length / 2);
-    return timeline.map((b, i) => {
-      let sum = 0, wSum = 0;
-      for (let j = 0; j < weights.length; j++) {
-        const idx = i - hw + j;
-        if (idx >= 0 && idx < timeline.length) {
-          sum += timeline[idx].intensity * weights[j];
-          wSum += weights[j];
-        }
-      }
-      return { ...b, intensity: Math.round(sum / wSum) };
-    });
-  }, [timeline]);
 
   // ─── Styles ────────────────────────────────────────────────────────
   const card = {
@@ -333,6 +363,15 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
       </div>
 
       <div style={{ padding: "20px 24px", maxWidth: 1100, margin: "0 auto" }}>
+
+        {/* ─── Gaze Replay Player ──────────────────────────────── */}
+        <div style={{ ...card, marginBottom: 20 }}>
+          <div style={sectionTitle}>Gaze Replay</div>
+          <GazeReplayPlayer videoFile={videoFile ?? null} gazeData={gazeData} />
+          <div style={{ fontSize: 10, color: "#555", marginTop: 8 }}>
+            Play the video to see your gaze position overlaid in real time. The trail fades over 1.2 seconds.
+          </div>
+        </div>
 
         {/* ─── Key Metrics Row ─────────────────────────────────────── */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 20 }}>
@@ -479,12 +518,12 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
             <div style={sectionTitle}>Gaze Statistics</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
               {[
-                { label: "Avg Gaze X", value: `${avgX}px`, color: "#40c0ff" },
-                { label: "Avg Gaze Y", value: `${avgY}px`, color: "#40c0ff" },
-                { label: "Std Dev X", value: `${stdX}px`, color: "#c080ff" },
-                { label: "Std Dev Y", value: `${stdY}px`, color: "#c080ff" },
-                { label: "Center Bias", value: `${centerPct.toFixed(1)}%`, color: centerPct > 40 ? "#60ff8c" : "#ffb420" },
-                { label: "Dispersion", value: `${dispersionScore}px`, color: dispersionScore < 100 ? "#60ff8c" : "#ff6040" },
+                { label: "Avg Gaze X", value: `${avgX}px`, color: "#40c0ff", desc: "Mean horizontal gaze position" },
+                { label: "Avg Gaze Y", value: `${avgY}px`, color: "#40c0ff", desc: "Mean vertical gaze position" },
+                { label: "Std Dev X", value: `${stdX}px`, color: "#c080ff", desc: "Horizontal spread of gaze" },
+                { label: "Std Dev Y", value: `${stdY}px`, color: "#c080ff", desc: "Vertical spread of gaze" },
+                { label: "Center Bias", value: `${centerPct.toFixed(1)}%`, color: centerPct > 40 ? "#60ff8c" : "#ffb420", desc: "Gaze in the inner 2×2 grid cells" },
+                { label: "Dispersion", value: `${dispersionScore}px`, color: dispersionScore < 100 ? "#60ff8c" : "#ff6040", desc: "Overall gaze scatter" },
               ].map((s, i) => (
                 <div key={i} style={{
                   padding: "10px 12px",
@@ -493,7 +532,8 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
                   border: "1px solid rgba(255,255,255,0.04)",
                 }}>
                   <div style={{ fontSize: 20, fontWeight: 800, color: s.color, fontVariantNumeric: "tabular-nums" }}>{s.value}</div>
-                  <div style={{ fontSize: 9, color: "#666", marginTop: 2 }}>{s.label}</div>
+                  <div style={{ fontSize: 9, color: "#888", marginTop: 2 }}>{s.label}</div>
+                  <div style={{ fontSize: 9, color: "#555", marginTop: 2 }}>{s.desc}</div>
                 </div>
               ))}
             </div>
