@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState, useRef, useCallback } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell, CartesianGrid, PieChart, Pie,
@@ -6,6 +6,10 @@ import {
 import { computeRegionAttention } from "./gazeUtils.js";
 import { heatColor } from "./canvasUtils.js";
 import { btnStyle, formatTime } from "./UIComponents.jsx";
+import {
+  loadSessions, saveSessions, deleteSession as deleteSessionById,
+  aggregateSessions, exportSessionsJSON, importSessionsJSON,
+} from "./sessionStore.js";
 
 const VIDEO_W = 640;
 const VIDEO_H = 360;
@@ -14,8 +18,75 @@ const VIDEO_H = 360;
 const EXPECTED_GAZE_HZ = 12;
 const BUCKET_SEC = 0.5;
 
-export default function ReportPage({ reportData, onBack }) {
-  const { gazeData, duration, videoName } = reportData;
+// Session selector values
+const VIEW_ALL = "__ALL__";
+
+export default function ReportPage({ reportData, sessions = [], onRefreshSessions, onBack }) {
+  // ─── Session Selection State ───────────────────────────────────────
+  const [selectedSessionId, setSelectedSessionId] = useState(
+    reportData?.activeSessionId ?? (sessions.length > 0 ? sessions[sessions.length - 1].id : VIEW_ALL)
+  );
+  const importInputRef = useRef(null);
+
+  // Determine active data source based on selection
+  const activeData = useMemo(() => {
+    if (selectedSessionId === VIEW_ALL) {
+      // Aggregate all sessions
+      const agg = aggregateSessions(sessions);
+      return {
+        gazeData: agg.gazeData,
+        duration: agg.duration,
+        videoName: agg.videoName,
+        sessionCount: agg.sessionCount,
+        label: `All Viewers (${agg.sessionCount})`,
+      };
+    }
+    // Single session
+    const session = sessions.find(s => s.id === selectedSessionId);
+    if (session) {
+      return {
+        gazeData: session.gazePoints,
+        duration: session.duration,
+        videoName: session.sourceVideoName,
+        sessionCount: 1,
+        label: `${session.sourceVideoName} — ${new Date(session.createdAt).toLocaleString()}`,
+      };
+    }
+    // Fallback to reportData (freshly recorded, not yet persisted edge case)
+    return {
+      gazeData: reportData?.gazeData ?? [],
+      duration: reportData?.duration ?? 0,
+      videoName: reportData?.videoName ?? "Untitled",
+      sessionCount: 1,
+      label: reportData?.videoName ?? "Current Session",
+    };
+  }, [selectedSessionId, sessions, reportData]);
+
+  const { gazeData, duration, videoName } = activeData;
+
+  // ─── Import handler ────────────────────────────────────────────────
+  const handleImport = useCallback(async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const result = await importSessionsJSON(file);
+      onRefreshSessions?.();
+      alert(`Imported ${result.added} new session(s). Total: ${result.total}.`);
+    } catch (err) {
+      alert(`Import failed: ${err.message}`);
+    }
+    if (importInputRef.current) importInputRef.current.value = "";
+  }, [onRefreshSessions]);
+
+  // ─── Delete handler ────────────────────────────────────────────────
+  const handleDeleteSelected = useCallback(() => {
+    if (selectedSessionId === VIEW_ALL) return;
+    if (!confirm("Delete this session?")) return;
+    deleteSessionById(selectedSessionId);
+    onRefreshSessions?.();
+    const remaining = loadSessions();
+    setSelectedSessionId(remaining.length > 0 ? remaining[remaining.length - 1].id : VIEW_ALL);
+  }, [selectedSessionId, onRefreshSessions]);
 
   // ─── Derived stats ─────────────────────────────────────────────────
   // Use wallTime (wall-clock elapsed since recording started) if available.
@@ -131,12 +202,22 @@ export default function ReportPage({ reportData, onBack }) {
       minHeight: "100vh", background: "#0a0b0f", color: "#e0e0e6",
       fontFamily: "'JetBrains Mono', 'SF Mono', 'Fira Code', monospace",
     }}>
+      {/* Hidden file input for import */}
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".json,application/json"
+        style={{ display: "none" }}
+        onChange={handleImport}
+      />
+
       {/* Header */}
       <div style={{
         padding: "16px 24px",
         borderBottom: "1px solid rgba(255,255,255,0.06)",
         display: "flex", alignItems: "center", justifyContent: "space-between",
         background: "rgba(255,255,255,0.02)",
+        flexWrap: "wrap", gap: 12,
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <button onClick={onBack} style={{
@@ -151,11 +232,78 @@ export default function ReportPage({ reportData, onBack }) {
             </div>
             <div style={{ fontSize: 10, color: "#666", letterSpacing: "1px" }}>
               {videoName ?? "Untitled"} · {formatTime(duration)} · {totalPoints.toLocaleString()} gaze points
+              {activeData.sessionCount > 1 && ` · ${activeData.sessionCount} viewers`}
             </div>
           </div>
         </div>
-        <div style={{ fontSize: 10, color: "#555" }}>
-          {new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}
+
+        {/* Session selector + actions */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {/* Dropdown */}
+          <select
+            value={selectedSessionId}
+            onChange={e => setSelectedSessionId(e.target.value)}
+            style={{
+              ...btnStyle,
+              background: "rgba(255,255,255,0.06)",
+              color: "#ccc",
+              border: "1px solid rgba(255,255,255,0.12)",
+              padding: "6px 10px",
+              fontSize: 11,
+              borderRadius: 6,
+              maxWidth: 260,
+              cursor: "pointer",
+              appearance: "none",
+              WebkitAppearance: "none",
+              backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E")`,
+              backgroundRepeat: "no-repeat",
+              backgroundPosition: "right 8px center",
+              paddingRight: 24,
+            }}
+          >
+            {sessions.length > 1 && (
+              <option value={VIEW_ALL}>👥 All Viewers ({sessions.length})</option>
+            )}
+            {[...sessions].reverse().map(s => (
+              <option key={s.id} value={s.id}>
+                {s.sourceVideoName} — {new Date(s.createdAt).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+              </option>
+            ))}
+          </select>
+
+          {/* Delete selected */}
+          {selectedSessionId !== VIEW_ALL && sessions.length > 0 && (
+            <button onClick={handleDeleteSelected} title="Delete session" style={{
+              ...btnStyle,
+              background: "rgba(255,60,60,0.1)", color: "#ff8080",
+              border: "1px solid rgba(255,60,60,0.2)",
+              padding: "6px 10px", fontSize: 11,
+            }}>🗑</button>
+          )}
+
+          {/* Divider */}
+          <div style={{ width: 1, height: 20, background: "rgba(255,255,255,0.08)" }} />
+
+          {/* Export */}
+          <button onClick={exportSessionsJSON} title="Export all sessions as JSON" style={{
+            ...btnStyle,
+            background: "rgba(96,255,140,0.08)", color: "#60ff8c",
+            border: "1px solid rgba(96,255,140,0.2)",
+            padding: "6px 12px", fontSize: 11,
+          }}>↓ Export</button>
+
+          {/* Import */}
+          <button onClick={() => importInputRef.current?.click()} title="Import sessions from JSON" style={{
+            ...btnStyle,
+            background: "rgba(160,200,255,0.08)", color: "#a0c8ff",
+            border: "1px solid rgba(160,200,255,0.2)",
+            padding: "6px 12px", fontSize: 11,
+          }}>↑ Import</button>
+
+          {/* Date */}
+          <div style={{ fontSize: 10, color: "#555", marginLeft: 4 }}>
+            {new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}
+          </div>
         </div>
       </div>
 
