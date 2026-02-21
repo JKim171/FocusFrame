@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
+import { ReferenceLine, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
 
 import { generateSyntheticGaze, computeHeatmapForFrame, computeRegionAttention, computeAttentionTimeline } from "./gazeUtils.js";
 import { heatColor } from "./canvasUtils.js";
@@ -44,6 +44,10 @@ const VERIFY_DOTS = [
   { fx: 0.92, fy: 0.08 },  // top-right
   { fx: 0.08, fy: 0.92 },  // bottom-left
   { fx: 0.92, fy: 0.92 },  // bottom-right
+  { fx: 0.5,  fy: 0.08 },  // top-center
+  { fx: 0.92, fy: 0.5  },  // right-center
+  { fx: 0.5,  fy: 0.92 },  // bottom-center
+  { fx: 0.08, fy: 0.5  },  // left-center
 ];
 
 export default function VideoAttentionHeatmap() {
@@ -97,15 +101,39 @@ export default function VideoAttentionHeatmap() {
   const liveGazeRef = useRef([]);                          // mutable accumulator — drives canvas
   const currentVideoTimeRef = useRef(0);                   // always latest currentTime (no stale closure)
   const liveGazeUpdateTimer = useRef(null);
+  const trackingStartRef = useRef(null);                   // wall-clock ms when tracking began
 
   const gazeData = useMemo(() => generateSyntheticGaze(DURATION, FPS, VIDEO_W, VIDEO_H), []);
 
   // Use real gaze when tracking, synthetic otherwise
   const activeGazeData = eyeTrackerStatus === "tracking" ? liveGazeData : gazeData;
-  const timeline = useMemo(
-    () => computeAttentionTimeline(activeGazeData, uploadedVideoDuration || DURATION),
-    [activeGazeData, uploadedVideoDuration]
+
+  // Synthetic timeline (used when not tracking)
+  const syntheticTimeline = useMemo(
+    () => computeAttentionTimeline(gazeData, uploadedVideoDuration || DURATION),
+    [gazeData, uploadedVideoDuration]
   );
+
+  // Live timeline: bucket gaze by wall-clock elapsed time with absolute counts
+  // 12 det/s × 0.5s bucket = 6 pts → 100%
+  const LIVE_BUCKET_SEC = 0.5;
+  const EXPECTED_GAZE_HZ = 12;
+  const liveTimeline = useMemo(() => {
+    if (eyeTrackerStatus !== "tracking" || liveGazeData.length === 0) return null;
+    const withWall = liveGazeData.filter(p => p.wallTime !== undefined);
+    if (withWall.length === 0) return null;
+    const maxT = Math.max(...withWall.map(p => p.wallTime));
+    const buckets = [];
+    for (let t = 0; t <= maxT; t += LIVE_BUCKET_SEC) {
+      const count = withWall.filter(p => p.wallTime >= t && p.wallTime < t + LIVE_BUCKET_SEC).length;
+      const intensity = Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * LIVE_BUCKET_SEC)) * 100));
+      buckets.push({ time: +t.toFixed(1), intensity });
+    }
+    return buckets.length > 0 ? buckets : null;
+  }, [liveGazeData, eyeTrackerStatus]);
+
+  const timeline = liveTimeline ?? syntheticTimeline;
+
   const regions = useMemo(
     () => computeRegionAttention(activeGazeData, currentTime, windowSize, VIDEO_W, VIDEO_H, 4),
     [activeGazeData, currentTime, windowSize]
@@ -276,6 +304,7 @@ export default function VideoAttentionHeatmap() {
         if (sc.x >= 0 && sc.x < VIDEO_W && sc.y >= 0 && sc.y < VIDEO_H) {
           liveGazeRef.current.push({
             timestamp: currentVideoTimeRef.current,
+            wallTime: trackingStartRef.current != null ? (Date.now() - trackingStartRef.current) / 1000 : 0,
             x: Math.round(sc.x),
             y: Math.round(sc.y),
             frame: Math.round(currentVideoTimeRef.current * FPS),
@@ -348,9 +377,12 @@ export default function VideoAttentionHeatmap() {
       }
       setVerifyStep(next);
       setEyeTrackerStatus("tracking");
+      // Clear any gaze that leaked in during calibration/verify, then start wall clock
+      liveGazeRef.current = [];
+      trackingStartRef.current = Date.now();
       liveGazeUpdateTimer.current = setInterval(() => {
         setLiveGazeData([...liveGazeRef.current]);
-      }, 500);
+      }, 200);
     } else {
       setVerifyStep(next);
     }
@@ -358,6 +390,7 @@ export default function VideoAttentionHeatmap() {
 
   const resetGazeData = useCallback(() => {
     liveGazeRef.current = [];
+    trackingStartRef.current = Date.now(); // restart wall clock from now
     setLiveGazeData([]);
   }, []);
 
@@ -365,6 +398,7 @@ export default function VideoAttentionHeatmap() {
     if (calibAnimRef.current) { cancelAnimationFrame(calibAnimRef.current); calibAnimRef.current = null; }
     calibAnimRunningRef.current = false;
     if (liveGazeUpdateTimer.current) { clearInterval(liveGazeUpdateTimer.current); liveGazeUpdateTimer.current = null; }
+    trackingStartRef.current = null;
     liveGazeCursorRef.current = null;
     smoothedGazeRef.current = null;
     oneEuroRef.current = null;
@@ -438,9 +472,8 @@ export default function VideoAttentionHeatmap() {
         const [ax, ay] = WP[wpIdx - 1];
         const [bx, by] = WP[wpIdx];
         const t = Math.min(phaseElapsed / TRANSIT_MS, 1);
-        // Sine ease-in-out — smoother than quadratic (no discontinuous second derivative)
-        const eased = -(Math.cos(Math.PI * t) - 1) / 2;
-        calibDotPosRef.current = { fx: ax + (bx - ax) * eased, fy: ay + (by - ay) * eased };
+        // Linear — constant speed makes the dot easier to pursue smoothly
+        calibDotPosRef.current = { fx: ax + (bx - ax) * t, fy: ay + (by - ay) * t };
 
         if (phaseElapsed >= TRANSIT_MS) {
           calibDotPosRef.current = { fx: bx, fy: by };
@@ -651,10 +684,25 @@ export default function VideoAttentionHeatmap() {
 
   const topRegions = regions.slice(0, 5);
   const totalGazePoints = activeGazeData.length;
-  const currentBucket = timeline.find(b => Math.abs(b.time - Math.round(currentTime * 2) / 2) < 0.3);
-  const currentIntensity = currentBucket ? currentBucket.intensity : 0;
-  const peakTime = timeline.reduce((best, b) => b.intensity > best.intensity ? b : best, timeline[0]);
-  const lowTime = timeline.reduce((best, b) => b.intensity < best.intensity ? b : best, timeline[0]);
+  // Wall-clock position within the live timeline (snapped to 0.5s grid)
+  const timelineX = eyeTrackerStatus === "tracking" && trackingStartRef.current
+    ? Math.round(((Date.now() - trackingStartRef.current) / 1000) * 2) / 2
+    : Math.round(currentTime * 2) / 2;
+
+  // Absolute rolling-window intensity — reads the always-fresh ref via wallTime
+  const INTENSITY_WINDOW_SEC = 2;
+  const currentIntensity = (() => {
+    if (eyeTrackerStatus !== "tracking" || !trackingStartRef.current) return 0;
+    const wallNow = (Date.now() - trackingStartRef.current) / 1000;
+    const count = liveGazeRef.current.filter(
+      p => p.wallTime !== undefined && p.wallTime >= wallNow - INTENSITY_WINDOW_SEC && p.wallTime <= wallNow
+    ).length;
+    return Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * INTENSITY_WINDOW_SEC)) * 100));
+  })();
+
+  const fallbackBucket = { time: 0, intensity: 0 };
+  const peakTime = timeline.reduce((best, b) => b.intensity > best.intensity ? b : best, timeline[0] ?? fallbackBucket);
+  const lowTime  = timeline.reduce((best, b) => b.intensity < best.intensity ? b : best, timeline[0] ?? fallbackBucket);
 
   return (
     <>
@@ -990,18 +1038,15 @@ export default function VideoAttentionHeatmap() {
                     formatter={(v) => [`${v}%`, "Intensity"]}
                   />
                   <Area type="monotone" dataKey="intensity" stroke="#ff6040" fill="url(#attGrad)" strokeWidth={1.5} dot={false} />
-                  <Line type="monotone" dataKey={() => null} />
+                  <ReferenceLine
+                    x={timelineX}
+                    stroke="rgba(255,255,255,0.55)"
+                    strokeWidth={1.5}
+                    strokeDasharray="3 3"
+                    label={{ value: `${currentIntensity}%`, position: "top", fontSize: 9, fill: "#fff" }}
+                  />
                 </AreaChart>
               </ResponsiveContainer>
-              <div style={{ position: "relative", height: 2, marginTop: -4 }}>
-                <div style={{
-                  position: "absolute",
-                  left: `${(currentTime / DURATION) * 100}%`,
-                  top: -60, width: 2, height: 64,
-                  background: "rgba(255,255,255,0.25)",
-                  transition: isPlaying ? "none" : "left 0.15s ease",
-                }} />
-              </div>
             </div>
           </div>
 
@@ -1205,6 +1250,72 @@ export default function VideoAttentionHeatmap() {
               )}
             </PanelCard>
 
+            {/* Attention Intensity Meter */}
+            {(() => {
+              const hi = currentIntensity > 70;
+              const mid = currentIntensity > 35;
+              const meterColor = hi ? "#ff4040" : mid ? "#ffb420" : "#40a0ff";
+              const meterLabel = hi ? "HIGH" : mid ? "MODERATE" : "LOW";
+              const meterBg = hi ? "rgba(255,64,64,0.08)" : mid ? "rgba(255,180,32,0.08)" : "rgba(64,160,255,0.08)";
+              const meterBorder = hi ? "rgba(255,64,64,0.25)" : mid ? "rgba(255,180,32,0.25)" : "rgba(64,160,255,0.25)";
+              return (
+                <div style={{
+                  padding: "12px 14px",
+                  background: meterBg,
+                  borderRadius: 10,
+                  border: `1px solid ${meterBorder}`,
+                  transition: "background 0.4s ease, border-color 0.4s ease",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 8 }}>
+                    <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: "1px" }}>LIVE INTENSITY</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                      {eyeTrackerStatus === "tracking" && (
+                        <div style={{ width: 6, height: 6, borderRadius: "50%", background: meterColor, boxShadow: `0 0 6px ${meterColor}`, animation: "pulse 1s infinite" }} />
+                      )}
+                      <div style={{ fontSize: 10, fontWeight: 700, color: meterColor, letterSpacing: "1px" }}>{meterLabel}</div>
+                    </div>
+                  </div>
+                  {/* Big number */}
+                  <div style={{ fontSize: 38, fontWeight: 800, color: meterColor, lineHeight: 1, marginBottom: 8, fontVariantNumeric: "tabular-nums", transition: "color 0.4s ease" }}>
+                    {currentIntensity}<span style={{ fontSize: 16, fontWeight: 600, opacity: 0.7 }}>%</span>
+                  </div>
+                  {/* Intensity bar */}
+                  <div style={{ height: 6, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+                    <div style={{
+                      height: "100%", borderRadius: 3,
+                      width: `${currentIntensity}%`,
+                      background: `linear-gradient(90deg, ${mid ? "#ff6040" : "#40a0ff"}, ${meterColor})`,
+                      transition: "width 0.3s ease, background 0.4s ease",
+                      boxShadow: `0 0 6px ${meterColor}80`,
+                    }} />
+                  </div>
+                  {/* Sparkline of last 10 buckets */}
+                  {timeline.length > 0 && (() => {
+                    const idx = timeline.findIndex(b => b.time === timelineX);
+                    const slice = idx >= 0 ? timeline.slice(Math.max(0, idx - 9), idx + 1) : timeline.slice(-10);
+                    const max = Math.max(...slice.map(b => b.intensity), 1);
+                    const barW = 100 / Math.max(slice.length, 1);
+                    return (
+                      <div style={{ display: "flex", alignItems: "flex-end", gap: 1, height: 24, marginTop: 8 }}>
+                        {slice.map((b, i) => {
+                          const h = Math.max(2, (b.intensity / max) * 24);
+                          const isCurrent = i === slice.length - 1;
+                          return (
+                            <div key={b.time} style={{
+                              flex: 1, height: h, borderRadius: 1,
+                              background: isCurrent ? meterColor : `${meterColor}60`,
+                              transition: "height 0.3s ease",
+                              alignSelf: "flex-end",
+                            }} />
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              );
+            })()}
+
             {/* Data Panel */}
             <div style={{ flex: 1 }}>
               <div style={{
@@ -1253,14 +1364,78 @@ export default function VideoAttentionHeatmap() {
                 </div>
               )}
 
-              {activeTab === "insights" && (
-                <PanelCard title="AI Insights">
-                  <Insight icon="⚠️" color="#ffb420" title="CTA Blindness Detected" text="Bottom-right CTA region received only 4.2% of total attention. Consider repositioning." />
-                  <Insight icon="🎯" color="#60ff8c" title="Strong Center Bias" text="57% of gaze concentrated in center regions during first 10 seconds." />
-                  <Insight icon="📉" color="#ff6040" title="Attention Drop" text={`Significant drop at ${lowTime.time}s — consider adding visual cue or transition.`} />
-                  <Insight icon="👤" color="#40a0ff" title="Face Attraction" text="Face regions captured 42% attention — confirms face-priority viewing behavior." />
-                </PanelCard>
-              )}
+              {activeTab === "insights" && (() => {
+                // Derive real insights from computed data
+                const topRegion = regions[0];
+                const bottomRegion = regions[regions.length - 1];
+                const centerRegions = regions.filter(r => r.row >= 1 && r.row <= 2 && r.col >= 1 && r.col <= 2);
+                const centerPct = centerRegions.reduce((s, r) => s + r.attention, 0);
+                const avgIntensity = timeline.length > 0 ? Math.round(timeline.reduce((s, b) => s + b.intensity, 0) / timeline.length) : 0;
+                const intensityRange = timeline.length > 1 ? peakTime.intensity - lowTime.intensity : 0;
+                const highBuckets = timeline.filter(b => b.intensity > 70).length;
+                const highPct = timeline.length > 0 ? Math.round(highBuckets / timeline.length * 100) : 0;
+
+                const insights = [];
+
+                if (topRegion) {
+                  insights.push({
+                    icon: "🎯",
+                    color: "#ff6040",
+                    title: `Top Zone: ${topRegion.label}`,
+                    text: `${topRegion.attention.toFixed(1)}% of gaze points fall in the ${topRegion.label.toLowerCase()} — the single hottest region.`,
+                  });
+                }
+                if (bottomRegion && bottomRegion.attention < 2) {
+                  insights.push({
+                    icon: "⚠️",
+                    color: "#ffb420",
+                    title: "Neglected Region",
+                    text: `${bottomRegion.label} received only ${bottomRegion.attention.toFixed(1)}% attention in the current window. Consider adding a visual hook there.`,
+                  });
+                }
+                if (centerPct > 40) {
+                  insights.push({
+                    icon: "◎",
+                    color: "#60ff8c",
+                    title: "Strong Center Bias",
+                    text: `${centerPct.toFixed(1)}% of gaze is concentrated in the center 4 cells, showing classic center-weighted viewing.`,
+                  });
+                }
+                if (intensityRange > 40) {
+                  insights.push({
+                    icon: "📊",
+                    color: "#40c0ff",
+                    title: "High Variation",
+                    text: `Attention swings ${intensityRange}pts (${lowTime.intensity}%→${peakTime.intensity}%). Peak at ${peakTime.time}s, trough at ${lowTime.time}s.`,
+                  });
+                } else {
+                  insights.push({
+                    icon: "📉",
+                    color: "#c080ff",
+                    title: "Attention Trough",
+                    text: `Lowest engagement at ${lowTime.time}s (${lowTime.intensity}%). Avg across session: ${avgIntensity}%.`,
+                  });
+                }
+                if (highPct > 30) {
+                  insights.push({
+                    icon: "🔥",
+                    color: "#ff4040",
+                    title: "Sustained High Attention",
+                    text: `${highPct}% of time buckets exceed 70% intensity — strong consistent engagement.`,
+                  });
+                }
+
+                return (
+                  <PanelCard title="Insights">
+                    {insights.map((ins, i) => (
+                      <Insight key={i} icon={ins.icon} color={ins.color} title={ins.title} text={ins.text} />
+                    ))}
+                    {insights.length === 0 && (
+                      <div style={{ fontSize: 11, color: "#555", padding: "8px 0" }}>Not enough data yet — play the video or start eye tracking.</div>
+                    )}
+                  </PanelCard>
+                );
+              })()}
 
               {activeTab === "grid" && (
                 <PanelCard title="4×4 Attention Grid">
