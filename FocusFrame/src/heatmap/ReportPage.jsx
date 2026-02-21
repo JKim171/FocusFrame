@@ -180,6 +180,31 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
   // Fixation density estimate (how clustered gaze is — lower = more fixated)
   const dispersionScore = Math.round(Math.sqrt(stdX ** 2 + stdY ** 2));
 
+  // Regions sorted by attention descending (for hotspot, bar chart, etc.)
+  const sortedRegions = useMemo(
+    () => [...regions].sort((a, b) => b.attention - a.attention),
+    [regions]
+  );
+
+  // Smoothed timeline for the chart — 5-point Gaussian weighted rolling avg
+  // so the display flows between values instead of snapping 0↔100
+  const smoothedTimeline = useMemo(() => {
+    if (timeline.length < 3) return timeline;
+    const weights = [0.1, 0.2, 0.4, 0.2, 0.1];
+    const hw = Math.floor(weights.length / 2);
+    return timeline.map((b, i) => {
+      let sum = 0, wSum = 0;
+      for (let j = 0; j < weights.length; j++) {
+        const idx = i - hw + j;
+        if (idx >= 0 && idx < timeline.length) {
+          sum += timeline[idx].intensity * weights[j];
+          wSum += weights[j];
+        }
+      }
+      return { ...b, intensity: Math.round(sum / wSum) };
+    });
+  }, [timeline]);
+
   // ─── Styles ────────────────────────────────────────────────────────
   const card = {
     background: "rgba(255,255,255,0.03)",
@@ -333,7 +358,7 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
           <div style={card}>
             <div style={sectionTitle}>Attention Intensity Over Time</div>
             <ResponsiveContainer width="100%" height={180}>
-              <AreaChart data={timeline}>
+              <AreaChart data={smoothedTimeline}>
                 <defs>
                   <linearGradient id="reportGrad" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="#ff6040" stopOpacity={0.35} />
@@ -342,13 +367,15 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
                 <XAxis
-                  dataKey="time" tick={{ fontSize: 9, fill: "#555" }}
+                  dataKey="time"
+                  tick={{ fontSize: 9, fill: "#555", style: { fill: "#555" } }}
                   tickLine={false} axisLine={{ stroke: "#222" }}
                   label={{ value: "Time (s)", position: "insideBottomRight", offset: -4, fontSize: 9, fill: "#555" }}
                 />
                 <YAxis
                   hide={false} domain={[0, 100]}
-                  tick={{ fontSize: 9, fill: "#555" }} tickLine={false} axisLine={false}
+                  tick={{ fontSize: 9, fill: "#555", style: { fill: "#555" } }}
+                  tickLine={false} axisLine={false}
                   width={30}
                 />
                 <Tooltip
@@ -541,12 +568,12 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
             {/* Top region + neglected */}
             <div style={{ padding: "10px 14px", background: "rgba(255,255,255,0.02)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.04)" }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#ff6040", marginBottom: 4 }}>
-                🎯 Hotspot: {regions[0]?.label ?? "—"}
+                🎯 Hotspot: {sortedRegions[0]?.label ?? "—"}
               </div>
               <div style={{ fontSize: 10, color: "#777", lineHeight: 1.5 }}>
-                Top zone received {regions[0]?.attention.toFixed(1)}% of all gaze.
-                {regions.length > 0 && regions[regions.length - 1].attention < 1.5
-                  ? ` ${regions[regions.length - 1].label} received only ${regions[regions.length - 1].attention.toFixed(1)}% — effectively a blind spot.`
+                Top zone received {sortedRegions[0]?.attention.toFixed(1)}% of all gaze.
+                {sortedRegions.length > 0 && sortedRegions[sortedRegions.length - 1].attention < 1.5
+                  ? ` ${sortedRegions[sortedRegions.length - 1].label} received only ${sortedRegions[sortedRegions.length - 1].attention.toFixed(1)}% — effectively a blind spot.`
                   : " Attention was reasonably distributed across zones."}
               </div>
             </div>
@@ -557,17 +584,26 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
         <div style={{ ...card, marginBottom: 20 }}>
           <div style={sectionTitle}>Top Attention Regions</div>
           <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={regions.slice(0, 8)} layout="vertical">
+            <BarChart data={sortedRegions.slice(0, 8)} layout="vertical">
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" horizontal={false} />
-              <XAxis type="number" domain={[0, "dataMax"]} tick={{ fontSize: 9, fill: "#555" }} unit="%" />
-              <YAxis type="category" dataKey="label" tick={{ fontSize: 9, fill: "#888" }} width={130} />
+              <XAxis
+                type="number" domain={[0, "dataMax"]} unit="%"
+                tick={{ fontSize: 9, fill: "#555", style: { fill: "#555" } }}
+                tickLine={false} axisLine={{ stroke: "#333" }}
+              />
+              <YAxis
+                type="category" dataKey="label" width={130}
+                tick={{ fontSize: 9, fill: "#aaa", style: { fill: "#aaa" } }}
+                tickLine={false} axisLine={false}
+              />
               <Tooltip
                 contentStyle={{ background: "#1a1b22", border: "1px solid #333", borderRadius: 6, fontSize: 11 }}
+                labelStyle={{ color: "#aaa" }}
                 formatter={(v) => [`${v.toFixed(1)}%`, "Attention"]}
               />
               <Bar dataKey="attention" radius={[0, 4, 4, 0]}>
-                {regions.slice(0, 8).map((_, i) => {
-                  const t = i / 7;
+                {sortedRegions.slice(0, 8).map((_, i) => {
+                  const t = i / Math.max(sortedRegions.slice(0, 8).length - 1, 1);
                   const [r, g, b] = heatColor(1 - t);
                   return <Cell key={i} fill={`rgb(${r},${g},${b})`} />;
                 })}

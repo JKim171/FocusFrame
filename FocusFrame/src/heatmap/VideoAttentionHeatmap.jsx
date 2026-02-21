@@ -44,7 +44,7 @@ const DWELL_MS   = 1400;
 const TRANSIT_MS = 1200;
 const SETTLE_MS  = 400;
 
-export default function VideoAttentionHeatmap({ onViewReport }) {
+export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) {
   // ─── Refs ────────────────────────────────────────────────────────────
   const canvasRef                = useRef(null);
   const containerRef             = useRef(null);
@@ -970,6 +970,17 @@ export default function VideoAttentionHeatmap({ onViewReport }) {
                   <div style={{ fontSize: 10, color: "#555", textAlign: "center" }}>Upload a video first</div>
                 )}
                 {etError && <div style={{ fontSize: 10, color: "#ff6060", marginTop: 4 }}>✕ {etError}</div>}
+                {onViewSessions && (
+                  <button
+                    onClick={onViewSessions}
+                    style={{
+                      ...btnStyle, width: "100%", padding: "10px 0", fontSize: 11, fontWeight: 600,
+                      background: "rgba(255,180,40,0.08)", color: "#ffb420",
+                      border: "1px solid rgba(255,180,40,0.2)",
+                      marginTop: 4,
+                    }}
+                  >📊 View Past Sessions</button>
+                )}
               </div>
             )}
 

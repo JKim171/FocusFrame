@@ -34,6 +34,18 @@ function App() {
     setReportData({ ...data, activeSessionId: session.id });
   }, []);
 
+  // Open report to browse all past sessions (no new recording)
+  const handleViewSessions = useCallback(() => {
+    const s = loadSessions();
+    setSessions(s);
+    if (s.length === 0) {
+      alert('No saved sessions yet. Record a session first, then click "View Report" to save it.');
+      return;
+    }
+    // Open report with "All Viewers" pre-selected
+    setReportData({ gazeData: [], duration: 0, videoName: 'All Sessions', activeSessionId: '__ALL__' });
+  }, []);
+
   if (reportData) {
     return (
       <ReportPage
@@ -47,7 +59,7 @@ function App() {
 
   return (
     <div>
-      <VideoAttentionHeatmap onViewReport={handleViewReport} />
+      <VideoAttentionHeatmap onViewReport={handleViewReport} onViewSessions={handleViewSessions} />
     </div>
   );
 }
