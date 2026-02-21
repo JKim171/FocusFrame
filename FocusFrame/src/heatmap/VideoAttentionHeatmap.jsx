@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Line, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
+import { ReferenceLine, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
 
 import { computeHeatmapForFrame, computeRegionAttention, computeAttentionTimeline } from "./gazeUtils.js";
 import { heatColor } from "./canvasUtils.js";
@@ -97,10 +97,26 @@ export default function VideoAttentionHeatmap() {
   const activeDuration = uploadedVideoDuration ?? 30;
   const gazeData       = liveGazeData.length > 0 ? liveGazeData : [];
 
-  const timeline = useMemo(
-    () => gazeData.length > 0 ? computeAttentionTimeline(gazeData, activeDuration) : [],
-    [gazeData, activeDuration]
-  );
+  // During recording: bucket by wallTime (independent of video playback position)
+  // During review: bucket by video timestamp as before
+  const LIVE_BUCKET_SEC = 0.5;
+  const EXPECTED_GAZE_HZ = 12;
+  const INTENSITY_WINDOW_SEC = 2;
+  const timeline = useMemo(() => {
+    if (gazeData.length === 0) return [];
+    const hasWallTime = gazeData.some(p => p.wallTime !== undefined);
+    if (hasWallTime) {
+      const maxT = Math.max(...gazeData.map(p => p.wallTime ?? 0));
+      const buckets = [];
+      for (let t = 0; t <= maxT; t += LIVE_BUCKET_SEC) {
+        const count = gazeData.filter(p => p.wallTime !== undefined && p.wallTime >= t && p.wallTime < t + LIVE_BUCKET_SEC).length;
+        const intensity = Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * LIVE_BUCKET_SEC)) * 100));
+        buckets.push({ time: +t.toFixed(1), intensity });
+      }
+      return buckets;
+    }
+    return computeAttentionTimeline(gazeData, activeDuration);
+  }, [gazeData, activeDuration]);
   const regions = useMemo(
     () => gazeData.length > 0
       ? computeRegionAttention(gazeData, currentTime, windowSize, VIDEO_W, VIDEO_H, 4)
@@ -232,7 +248,7 @@ export default function VideoAttentionHeatmap() {
     // Start the live gaze data timer
     liveGazeUpdateTimer.current = setInterval(() => {
       setLiveGazeData([...liveGazeRef.current]);
-    }, 500);
+    }, 200);
 
     // Start the eye tracker canvas loop
     const tick = () => {
@@ -275,7 +291,7 @@ export default function VideoAttentionHeatmap() {
       // Start gaze data timer
       liveGazeUpdateTimer.current = setInterval(() => {
         setLiveGazeData([...liveGazeRef.current]);
-      }, 500);
+      }, 200);
 
       // Start canvas render loop
       const tick = () => {
@@ -370,6 +386,7 @@ export default function VideoAttentionHeatmap() {
         if (sc.x >= 0 && sc.x < VIDEO_W && sc.y >= 0 && sc.y < VIDEO_H) {
           liveGazeRef.current.push({
             timestamp: currentVideoTimeRef.current,
+            wallTime: recordingStartRef.current != null ? (performance.now() - recordingStartRef.current) / 1000 : 0,
             x: Math.round(sc.x),
             y: Math.round(sc.y),
             frame: Math.round(currentVideoTimeRef.current * FPS),
@@ -605,8 +622,14 @@ export default function VideoAttentionHeatmap() {
   // ─── Computed Metrics ──────────────────────────────────────────────
   const topRegions      = regions.slice(0, 5);
   const totalGazePoints = gazeData.length;
-  const currentBucket    = timeline.find(b => Math.abs(b.time - Math.round(currentTime * 2) / 2) < 0.3);
-  const currentIntensity = currentBucket ? currentBucket.intensity : 0;
+  const currentIntensity = (() => {
+    if (phase !== PHASE.RECORDING || !recordingStartRef.current) return 0;
+    const wallNow = (performance.now() - recordingStartRef.current) / 1000;
+    const count = liveGazeRef.current.filter(
+      p => p.wallTime !== undefined && p.wallTime >= wallNow - INTENSITY_WINDOW_SEC && p.wallTime <= wallNow
+    ).length;
+    return Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * INTENSITY_WINDOW_SEC)) * 100));
+  })();
   const peakTime = timeline.length > 0 ? timeline.reduce((best, b) => b.intensity > best.intensity ? b : best, timeline[0]) : { intensity: 0, time: 0 };
   const lowTime  = timeline.length > 0 ? timeline.reduce((best, b) => b.intensity < best.intensity ? b : best, timeline[0]) : { intensity: 0, time: 0 };
 
@@ -858,18 +881,23 @@ export default function VideoAttentionHeatmap() {
                     formatter={(v) => [`${v}%`, "Intensity"]}
                   />
                   <Area type="monotone" dataKey="intensity" stroke="#ff6040" fill="url(#attGrad)" strokeWidth={1.5} dot={false} />
-                  <Line type="monotone" dataKey={() => null} />
+                  {timeline.length > 0 && (
+                    <ReferenceLine
+                      x={(() => {
+                        if (recordingStartRef.current) {
+                          const w = Math.round(((performance.now() - recordingStartRef.current) / 1000) * 2) / 2;
+                          return +w.toFixed(1);
+                        }
+                        return Math.round(currentTime * 2) / 2;
+                      })()}
+                      stroke="rgba(255,255,255,0.5)"
+                      strokeWidth={1.5}
+                      strokeDasharray="3 3"
+                    />
+                  )}
                 </AreaChart>
               </ResponsiveContainer>
-              <div style={{ position: "relative", height: 2, marginTop: -4 }}>
-                <div style={{
-                  position: "absolute",
-                  left: `${(currentTime / activeDuration) * 100}%`,
-                  top: -60, width: 2, height: 64,
-                  background: "rgba(255,255,255,0.25)",
-                  transition: isPlaying ? "none" : "left 0.15s ease",
-                }} />
-              </div>
+
             </div>
           )}
         </div>
@@ -1065,6 +1093,72 @@ export default function VideoAttentionHeatmap() {
               <ToggleBtn active={showGaze} onClick={() => setShowGaze(!showGaze)} label="Gaze Pts" color="#00ffc8" />
             </div>
           </PanelCard>
+
+          {/* Live Intensity Meter — recording only */}
+          {phase === PHASE.RECORDING && (() => {
+            const hi = currentIntensity > 70;
+            const mid = currentIntensity > 35;
+            const meterColor = hi ? "#ff4040" : mid ? "#ffb420" : "#40a0ff";
+            const meterLabel = hi ? "HIGH" : mid ? "MODERATE" : "LOW";
+            const meterBg = hi ? "rgba(255,64,64,0.08)" : mid ? "rgba(255,180,32,0.08)" : "rgba(64,160,255,0.08)";
+            const meterBorder = hi ? "rgba(255,64,64,0.25)" : mid ? "rgba(255,180,32,0.25)" : "rgba(64,160,255,0.25)";
+            return (
+              <div style={{
+                padding: "12px 14px",
+                background: meterBg,
+                borderRadius: 10,
+                border: `1px solid ${meterBorder}`,
+                transition: "background 0.4s ease, border-color 0.4s ease",
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 8 }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: "1px" }}>LIVE INTENSITY</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <div style={{ width: 6, height: 6, borderRadius: "50%", background: meterColor, boxShadow: `0 0 6px ${meterColor}`, animation: "pulse 1s infinite" }} />
+                    <div style={{ fontSize: 10, fontWeight: 700, color: meterColor, letterSpacing: "1px" }}>{meterLabel}</div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 38, fontWeight: 800, color: meterColor, lineHeight: 1, marginBottom: 8, fontVariantNumeric: "tabular-nums", transition: "color 0.4s ease" }}>
+                  {currentIntensity}<span style={{ fontSize: 16, fontWeight: 600, opacity: 0.7 }}>%</span>
+                </div>
+                <div style={{ height: 6, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+                  <div style={{
+                    height: "100%", borderRadius: 3,
+                    width: `${currentIntensity}%`,
+                    background: `linear-gradient(90deg, ${mid ? "#ff6040" : "#40a0ff"}, ${meterColor})`,
+                    transition: "width 0.3s ease, background 0.4s ease",
+                    boxShadow: `0 0 6px ${meterColor}80`,
+                  }} />
+                </div>
+                {/* Sparkline of recent wall-clock buckets */}
+                {phase === PHASE.RECORDING && recordingStartRef.current && (() => {
+                  const wallNow = (performance.now() - recordingStartRef.current) / 1000;
+                  const BUCKET = 0.5;
+                  const NUM_BARS = 10;
+                  const bars = [];
+                  for (let i = NUM_BARS - 1; i >= 0; i--) {
+                    const t0 = wallNow - (i + 1) * BUCKET;
+                    const t1 = wallNow - i * BUCKET;
+                    if (t0 < 0) { bars.push(null); continue; }
+                    const count = liveGazeRef.current.filter(p => p.wallTime !== undefined && p.wallTime >= t0 && p.wallTime < t1).length;
+                    bars.push({ intensity: Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * BUCKET)) * 100)), isCurrent: i === 0 });
+                  }
+                  const maxVal = Math.max(...bars.filter(Boolean).map(b => b.intensity), 1);
+                  return (
+                    <div style={{ display: "flex", alignItems: "flex-end", gap: 1, height: 24, marginTop: 8 }}>
+                      {bars.map((b, i) => (
+                        <div key={i} style={{
+                          flex: 1, borderRadius: 1, alignSelf: "flex-end",
+                          height: b ? Math.max(2, (b.intensity / maxVal) * 24) : 2,
+                          background: b?.isCurrent ? meterColor : b ? `${meterColor}60` : "rgba(255,255,255,0.05)",
+                          transition: "height 0.3s ease",
+                        }} />
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
+            );
+          })()}
 
           {/* Analytics (visible in recording & review) */}
           {(phase === PHASE.REVIEW || phase === PHASE.RECORDING) && gazeData.length > 0 && (
