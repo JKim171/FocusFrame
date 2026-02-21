@@ -3,27 +3,63 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, Cell, CartesianGrid, PieChart, Pie,
 } from "recharts";
-import { computeRegionAttention, computeAttentionTimeline } from "./gazeUtils.js";
+import { computeRegionAttention } from "./gazeUtils.js";
 import { heatColor } from "./canvasUtils.js";
 import { btnStyle, formatTime } from "./UIComponents.jsx";
 
 const VIDEO_W = 640;
 const VIDEO_H = 360;
 
+// Same parameters as the live intensity meter
+const EXPECTED_GAZE_HZ = 12;
+const BUCKET_SEC = 0.5;
+
 export default function ReportPage({ reportData, onBack }) {
   const { gazeData, duration, videoName } = reportData;
 
   // ─── Derived stats ─────────────────────────────────────────────────
-  const timeline = useMemo(
-    () => computeAttentionTimeline(gazeData, duration),
-    [gazeData, duration]
-  );
+  // Use wallTime (wall-clock elapsed since recording started) if available.
+  // This is the same time axis the live intensity meter uses, so numbers match.
+  const hasWallTime = gazeData.some(p => p.wallTime !== undefined);
 
-  // Full-session region breakdown (window = entire duration, centered at midpoint)
-  const regions = useMemo(
-    () => computeRegionAttention(gazeData, duration / 2, duration + 1, VIDEO_W, VIDEO_H, 4),
-    [gazeData, duration]
-  );
+  const timeline = useMemo(() => {
+    if (gazeData.length === 0) return [];
+    if (hasWallTime) {
+      const maxT = Math.max(...gazeData.map(p => p.wallTime ?? 0));
+      const buckets = [];
+      for (let t = 0; t <= maxT; t += BUCKET_SEC) {
+        const count = gazeData.filter(
+          p => p.wallTime !== undefined && p.wallTime >= t && p.wallTime < t + BUCKET_SEC
+        ).length;
+        // Absolute scale: EXPECTED_GAZE_HZ * BUCKET_SEC points = 100%
+        const intensity = Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * BUCKET_SEC)) * 100));
+        buckets.push({ time: +t.toFixed(1), intensity });
+      }
+      return buckets;
+    }
+    // Fallback: timestamp-based with relative normalisation
+    const maxT2 = gazeData.length > 0 ? Math.max(...gazeData.map(p => p.timestamp)) : duration;
+    const maxT3 = Math.max(maxT2, duration);
+    const buckets2 = [];
+    for (let t = 0; t <= maxT3; t += BUCKET_SEC) {
+      const count = gazeData.filter(p => p.timestamp >= t && p.timestamp < t + BUCKET_SEC).length;
+      const intensity = Math.min(100, Math.round((count / (EXPECTED_GAZE_HZ * BUCKET_SEC)) * 100));
+      buckets2.push({ time: +t.toFixed(1), intensity });
+    }
+    return buckets2;
+  }, [gazeData, duration, hasWallTime]);
+
+  // Region map: filter by wallTime full window when available, else full timestamp window
+  const regions = useMemo(() => {
+    if (gazeData.length === 0) return [];
+    if (hasWallTime) {
+      // Remap wallTime → timestamp so computeRegionAttention can filter correctly
+      const remapped = gazeData.map(p => ({ ...p, timestamp: p.wallTime ?? p.timestamp }));
+      const maxW = Math.max(...remapped.map(p => p.timestamp));
+      return computeRegionAttention(remapped, maxW / 2, maxW + 1, VIDEO_W, VIDEO_H, 4);
+    }
+    return computeRegionAttention(gazeData, duration / 2, duration + 1, VIDEO_W, VIDEO_H, 4);
+  }, [gazeData, duration, hasWallTime]);
 
   const totalPoints = gazeData.length;
   const avgIntensity = timeline.length > 0
