@@ -44,7 +44,7 @@ const DWELL_MS   = 1400;
 const TRANSIT_MS = 1200;
 const SETTLE_MS  = 400;
 
-export default function VideoAttentionHeatmap() {
+export default function VideoAttentionHeatmap({ onViewReport }) {
   // ─── Refs ────────────────────────────────────────────────────────────
   const canvasRef                = useRef(null);
   const containerRef             = useRef(null);
@@ -1078,6 +1078,19 @@ export default function VideoAttentionHeatmap() {
                   background: "rgba(100,200,255,0.1)", color: "#64c8ff",
                   border: "1px solid rgba(100,200,255,0.2)", fontSize: 10,
                 }}>↻ New Session</button>
+                {onViewReport && gazeData.length > 0 && (
+                  <button onClick={() => onViewReport({
+                    gazeData: [...gazeData],
+                    duration: activeDuration,
+                    videoName: uploadedVideoName,
+                  })} style={{
+                    ...btnStyle, width: "100%", padding: "10px 0",
+                    background: "linear-gradient(135deg, rgba(255,96,64,0.2), rgba(255,180,40,0.2))",
+                    color: "#ff8040",
+                    border: "1px solid rgba(255,120,50,0.35)",
+                    fontSize: 12, fontWeight: 700,
+                  }}>📊 View Report</button>
+                )}
               </div>
             )}
           </PanelCard>
