@@ -1338,18 +1338,6 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions, hi
             </div>
           )}
 
-          {/* Heat Scale */}
-          <div style={{
-            marginTop: 4, padding: "10px 14px",
-            background: "rgba(255,255,255,0.03)",
-            borderRadius: 10, border: "1px solid rgba(255,255,255,0.06)",
-          }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: "0.8px", marginBottom: 6 }}>HEAT SCALE</div>
-            <div style={{ height: 12, borderRadius: 6, background: "linear-gradient(90deg, #0a1eb4, #14a0c8, #28c850, #e6dc1e, #fa820a, #f01e14)" }} />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#555", marginTop: 3 }}>
-              <span>Low</span><span>Medium</span><span>High</span>
-            </div>
-          </div>
         </div>
       </div>
 
