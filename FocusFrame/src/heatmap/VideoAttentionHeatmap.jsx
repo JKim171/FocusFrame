@@ -44,7 +44,7 @@ const DWELL_MS   = 1400;
 const TRANSIT_MS = 1200;
 const SETTLE_MS  = 400;
 
-export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) {
+export default function VideoAttentionHeatmap({ onViewReport, onViewSessions, hidden }) {
   // ─── Refs ────────────────────────────────────────────────────────────
   const canvasRef                = useRef(null);
   const containerRef             = useRef(null);
@@ -84,6 +84,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
   const [uploadedVideoDuration, setUploadedVideoDuration] = useState(null);
   const [uploadedVideoName, setUploadedVideoName]         = useState(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
+  const [showGazeCursor, setShowGazeCursor] = useState(true);
 
   // ─── Eye Tracker Sub-State ──────────────────────────────────────────
   // Tracks internal calibration progress within the CALIBRATING phase
@@ -267,6 +268,17 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
     setIsPlaying(true);
   }, [phase, etSubStatus, uploadedVideoUrl]);
 
+  // ─── Recalibrate (force redo) ───────────────────────────────────────
+  const handleRecalibrate = useCallback(() => {
+    calibratedRef.current = false;
+    destroyEyeTracker();
+    resetCalibration();
+    oneEuroRef.current = null;
+    prevIrisRef.current = null;
+    irisBufferRef.current = [];
+    calibrationPairsRef.current = [];
+  }, []);
+
   // ─── Session Actions ────────────────────────────────────────────────
   const handleStartSession = useCallback(async () => {
     // Reset all gaze data
@@ -300,14 +312,25 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
       };
       eyeTrackerRafRef.current = requestAnimationFrame(tick);
 
-      // Reset & play video immediately (synchronous in click handler context)
+      // Reset & play video — wait for readiness if needed
       if (uploadedVideoRef.current && uploadedVideoUrl) {
-        uploadedVideoRef.current.currentTime = 0;
-        uploadedVideoRef.current.play().catch(() => {});
+        const v = uploadedVideoRef.current;
+        v.currentTime = 0;
+        const startPlay = () => {
+          v.play().catch(console.warn);
+          recordingStartRef.current = performance.now();
+          setPhase(PHASE.RECORDING);
+          setIsPlaying(true);
+        };
+        if (v.readyState >= 3) {
+          startPlay();
+        } else {
+          // Video needs to buffer (common after display:none) — wait for canplay
+          const onReady = () => { v.removeEventListener('canplay', onReady); startPlay(); };
+          v.addEventListener('canplay', onReady);
+          v.load(); // force re-buffer
+        }
       }
-      recordingStartRef.current = performance.now();
-      setPhase(PHASE.RECORDING);
-      setIsPlaying(true);
       return;
     }
 
@@ -457,6 +480,12 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
     setIsPlaying(false);
     setRecordingElapsed(0);
     recordingStartRef.current = null;
+
+    // Also reset the actual video element so it's clean for the next session
+    if (uploadedVideoRef.current) {
+      uploadedVideoRef.current.pause();
+      uploadedVideoRef.current.currentTime = 0;
+    }
   }, []);
 
   // ─── MP4 Upload ────────────────────────────────────────────────────
@@ -564,8 +593,8 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
       }
     }
 
-    // Live gaze cursor during recording
-    if (phase === PHASE.RECORDING) {
+    // Live gaze cursor during recording (toggle-able)
+    if (phase === PHASE.RECORDING && showGazeCursor) {
       const cur = liveGazeCursorRef.current;
       if (cur && cur.x >= 0 && cur.x < VIDEO_W && cur.y >= 0 && cur.y < VIDEO_H) {
         ctx.save();
@@ -587,10 +616,26 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
         ctx.restore();
       }
     }
-  }, [gazeData, currentTime, showHeatmap, showGaze, heatmapOpacity, windowSize, uploadedVideoUrl, phase]);
+  }, [gazeData, currentTime, showHeatmap, showGaze, showGazeCursor, heatmapOpacity, windowSize, uploadedVideoUrl, phase]);
 
   useEffect(() => { renderCanvasRef.current = renderCanvas; }, [renderCanvas]);
   useEffect(() => { renderCanvas(); }, [renderCanvas]);
+
+  // Re-kick video & canvas when component becomes visible after being hidden
+  const prevHiddenRef = useRef(hidden);
+  useEffect(() => {
+    if (prevHiddenRef.current && !hidden) {
+      // Component just became visible again — force video frame decode
+      if (uploadedVideoRef.current && uploadedVideoUrl) {
+        const v = uploadedVideoRef.current;
+        const t = v.currentTime;
+        v.currentTime = t; // re-seek forces frame buffer refresh
+      }
+      // Re-render canvas on next frame to pick up the fresh video frame
+      requestAnimationFrame(() => renderCanvasRef.current?.());
+    }
+    prevHiddenRef.current = hidden;
+  }, [hidden, uploadedVideoUrl]);
 
   // ─── Playback / Recording Loop ─────────────────────────────────────
   useEffect(() => {
@@ -949,6 +994,23 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
 
           {/* 2. Eye Tracking Session */}
           <PanelCard title="2 · Eye Tracking Session">
+            {/* Calibration Status */}
+            {phase === PHASE.IDLE && calibratedRef.current && (
+              <div style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                marginBottom: 8, padding: "5px 10px",
+                background: "rgba(96,255,140,0.06)", borderRadius: 6,
+                border: "1px solid rgba(96,255,140,0.15)",
+              }}>
+                <span style={{ fontSize: 10, color: "#60ff8c", fontWeight: 600 }}>✓ Calibrated</span>
+                <button onClick={handleRecalibrate} style={{
+                  ...btnStyle, fontSize: 9, padding: "3px 8px",
+                  background: "rgba(255,255,255,0.05)", color: "#888",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                }}>Recalibrate</button>
+              </div>
+            )}
+
             {/* IDLE */}
             {phase === PHASE.IDLE && (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1084,11 +1146,11 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
                     <span>{formatTime(activeDuration)}</span>
                   </div>
                 </div>
-                <button onClick={handleNewSession} style={{
+                <button onClick={() => { handleNewSession(); setTimeout(() => handleStartSession(), 0); }} style={{
                   ...btnStyle, width: "100%",
                   background: "rgba(100,200,255,0.1)", color: "#64c8ff",
                   border: "1px solid rgba(100,200,255,0.2)", fontSize: 10,
-                }}>↻ New Session</button>
+                }}>↻ Restart Session</button>
                 {onViewReport && gazeData.length > 0 && (
                   <button onClick={() => onViewReport({
                     gazeData: [...gazeData],
@@ -1115,6 +1177,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
             <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
               <ToggleBtn active={showHeatmap} onClick={() => setShowHeatmap(!showHeatmap)} label="Heatmap" color="#ff6040" />
               <ToggleBtn active={showGaze} onClick={() => setShowGaze(!showGaze)} label="Gaze Pts" color="#00ffc8" />
+              <ToggleBtn active={showGazeCursor} onClick={() => setShowGazeCursor(!showGazeCursor)} label="Live Cursor" color="#ff8040" />
             </div>
           </PanelCard>
 

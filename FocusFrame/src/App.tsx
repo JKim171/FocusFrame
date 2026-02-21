@@ -46,21 +46,20 @@ function App() {
     setReportData({ gazeData: [], duration: 0, videoName: 'All Sessions', activeSessionId: '__ALL__' });
   }, []);
 
-  if (reportData) {
-    return (
-      <ReportPage
-        reportData={reportData}
-        sessions={sessions}
-        onRefreshSessions={refreshSessions}
-        onBack={() => setReportData(null)}
-      />
-    );
-  }
-
   return (
-    <div>
-      <VideoAttentionHeatmap onViewReport={handleViewReport} onViewSessions={handleViewSessions} />
-    </div>
+    <>
+      {reportData && (
+        <ReportPage
+          reportData={reportData}
+          sessions={sessions}
+          onRefreshSessions={refreshSessions}
+          onBack={() => setReportData(null)}
+        />
+      )}
+      <div style={{ display: reportData ? 'none' : undefined }}>
+        <VideoAttentionHeatmap onViewReport={handleViewReport} onViewSessions={handleViewSessions} hidden={!!reportData} />
+      </div>
+    </>
   );
 }
 
