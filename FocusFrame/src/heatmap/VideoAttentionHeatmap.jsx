@@ -50,6 +50,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
   const containerRef             = useRef(null);
   const animRef                  = useRef(null);
   const uploadedVideoRef         = useRef(null);
+  const uploadedVideoFileRef     = useRef(null);
   const fileInputRef             = useRef(null);
   const renderCanvasRef          = useRef(null);
   const liveGazeCursorRef        = useRef(null);
@@ -464,6 +465,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
     const file = e.target.files?.[0];
     if (!file) return;
     if (uploadedVideoUrl) URL.revokeObjectURL(uploadedVideoUrl);
+    uploadedVideoFileRef.current = file;
     const url = URL.createObjectURL(file);
     setUploadedVideoUrl(url);
     setUploadedVideoName(file.name);
@@ -474,6 +476,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
 
   const clearUploadedVideo = useCallback(() => {
     setIsPlaying(false);
+    uploadedVideoFileRef.current = null;
     if (uploadedVideoRef.current) {
       uploadedVideoRef.current.pause();
       uploadedVideoRef.current.src = "";
@@ -1094,6 +1097,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions }) 
                     gazeData: [...gazeData],
                     duration: activeDuration,
                     videoName: uploadedVideoName,
+                    videoFile: uploadedVideoFileRef.current,
                   })} style={{
                     ...btnStyle, width: "100%", padding: "10px 0",
                     background: "linear-gradient(135deg, rgba(255,96,64,0.2), rgba(255,180,40,0.2))",

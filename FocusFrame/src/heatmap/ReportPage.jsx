@@ -10,6 +10,7 @@ import {
   loadSessions, saveSessions, deleteSession as deleteSessionById,
   aggregateSessions, exportSessionsJSON, importSessionsJSON,
 } from "./sessionStore.js";
+import GazeReplayPlayer from "./GazeReplayPlayer.jsx";
 
 const VIDEO_W = 640;
 const VIDEO_H = 360;
@@ -63,6 +64,12 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
   }, [selectedSessionId, sessions, reportData]);
 
   const { gazeData, duration, videoName } = activeData;
+
+  // videoFile is only available for the freshly recorded session (File objects
+  // can't be persisted to localStorage). Show the replay player only then.
+  const videoFile = selectedSessionId === reportData?.activeSessionId
+    ? (reportData?.videoFile ?? null)
+    : null;
 
   // ─── Import handler ────────────────────────────────────────────────
   const handleImport = useCallback(async (e) => {
@@ -333,6 +340,15 @@ export default function ReportPage({ reportData, sessions = [], onRefreshSession
       </div>
 
       <div style={{ padding: "20px 24px", maxWidth: 1100, margin: "0 auto" }}>
+
+        {/* ─── Gaze Replay Player ──────────────────────────────── */}
+        <div style={{ ...card, marginBottom: 20 }}>
+          <div style={sectionTitle}>Gaze Replay</div>
+          <GazeReplayPlayer videoFile={videoFile ?? null} gazeData={gazeData} />
+          <div style={{ fontSize: 10, color: "#555", marginTop: 8 }}>
+            Play the video to see your gaze position overlaid in real time. The trail fades over 1.2 seconds.
+          </div>
+        </div>
 
         {/* ─── Key Metrics Row ─────────────────────────────────────── */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 20 }}>
