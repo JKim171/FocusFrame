@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ReferenceLine, XAxis, YAxis, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
+import logo from "../assets/logo.png";
 
 import { computeHeatmapForFrame, computeRegionAttention, computeAttentionTimeline } from "./gazeUtils.js";
 import { heatColor } from "./canvasUtils.js";
@@ -701,11 +702,7 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions, hi
         background: "rgba(255,255,255,0.02)",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{
-            width: 32, height: 32, borderRadius: 8,
-            background: "linear-gradient(135deg, #ff4040, #ff8800)",
-            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16,
-          }}>🔥</div>
+          <img src={logo} alt="FocusFrame" style={{ width: 32, height: 32, borderRadius: 8, objectFit: "contain" }} />
           <div>
             <div style={{ fontSize: 15, fontWeight: 700, letterSpacing: "0.5px", color: "#fff" }}>FOCUSFRAME</div>
             <div style={{ fontSize: 10, color: "#666", letterSpacing: "1.5px", textTransform: "uppercase" }}>Attention Heatmap · MediaPipe Iris · v0.2</div>
@@ -1338,18 +1335,6 @@ export default function VideoAttentionHeatmap({ onViewReport, onViewSessions, hi
             </div>
           )}
 
-          {/* Heat Scale */}
-          <div style={{
-            marginTop: 4, padding: "10px 14px",
-            background: "rgba(255,255,255,0.03)",
-            borderRadius: 10, border: "1px solid rgba(255,255,255,0.06)",
-          }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: "0.8px", marginBottom: 6 }}>HEAT SCALE</div>
-            <div style={{ height: 12, borderRadius: 6, background: "linear-gradient(90deg, #0a1eb4, #14a0c8, #28c850, #e6dc1e, #fa820a, #f01e14)" }} />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#555", marginTop: 3 }}>
-              <span>Low</span><span>Medium</span><span>High</span>
-            </div>
-          </div>
         </div>
       </div>
 
